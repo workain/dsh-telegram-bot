@@ -1,4 +1,5 @@
 import {hasLiveSubagentOwner} from './session-api.js';
+import {isKnownTelegramRejection} from './topic-recovery.js';
 
 /**
  * Source-independent, live-only Session observer. No Host or Telegram imports.
@@ -154,6 +155,7 @@ export function createSessionWatch({ctx, getPolicy, ensureTopic, send, persist, 
         if (!chat || chat.chatId !== policy.chatId || chat.sessionId !== id ||
             !Number.isSafeInteger(chat.threadId)) throw new Error('Invalid topic binding');
       } catch (error) {
+        if (isKnownTelegramRejection(error)) throw error;
         uncertainTopics.add(key);
         await commit(() => { state.bindingErrors[key] = {chatId: policy.chatId, sessionId: id}; });
         uncertainTopics.delete(key);
@@ -176,7 +178,14 @@ export function createSessionWatch({ctx, getPolicy, ensureTopic, send, persist, 
   }
   function sessionRecord(id, seq, expected) {
     const saved = state.sessions[id];
-    if (saved && (saved.generation ?? 0) === expected.generation) return structuredClone(saved);
+    if (saved && (saved.generation ?? 0) === expected.generation) {
+      const value = structuredClone(saved);
+      const floor = getPolicy().historyThroughSeqs?.[id];
+      if (Number.isSafeInteger(floor) && floor > value.cursor) {
+        value.cursor = floor; value.handled = value.handled.filter(seq => seq > floor); value.turns = {};
+      }
+      return value;
+    }
     // New consent boundary: never carry off-period gaps or draft text forward.
     return {cursor: seq - 1, handled: [], turns: {}, generation: expected.generation};
   }
@@ -186,6 +195,11 @@ export function createSessionWatch({ctx, getPolicy, ensureTopic, send, persist, 
     if (!policyFor(id, session, expected)) return;
     const seq = event.seq;
     if (!Number.isSafeInteger(seq) || seq < 0) return;
+    if (getPolicy().mirrorMessages === true && ['turn/start', 'user/message', 'assistant/message', 'tool/call', 'turn/end'].includes(event.type)) {
+      if (!await binding(id, session, expected)) return;
+      const floor = getPolicy().historyThroughSeqs?.[id];
+      if (Number.isSafeInteger(floor) && seq <= floor) return;
+    }
     const record = sessionRecord(id, seq, expected);
     if (seq <= record.cursor || record.handled.includes(seq)) return;
     // Establish the live subscription boundary before any fallible side effect.
@@ -195,15 +209,30 @@ export function createSessionWatch({ctx, getPolicy, ensureTopic, send, persist, 
     if (event.type === 'turn/start' && turn !== null) {
       if (!await binding(id, session, expected)) return;
       record.turns[turn] ??= {text: ''};
+    } else if (event.type === 'user/message' && getPolicy().mirrorMessages === true) {
+      // Mirror only actual human input, never system injections or goal drivers.
+      const source = data.source;
+      const own = typeof source?.rpcId === 'string' && source.rpcId.startsWith(`telegram:${getPolicy().chatId}:`);
+      const text = boundedText((data.content ?? []).filter(block => block.type === 'text' && typeof block.text === 'string').map(block => block.text).join('\n').trim());
+      if (source?.kind === 'user' && text) {
+        if (!own && !await output(id, session, `👤 DSH\n${text}`, expected)) return;
+        record.deliveredMessages ??= []; record.deliveredMessages.push(seq);
+      }
     } else if (event.type === 'assistant/message' && turn !== null) {
       const content = data.message?.content;
       if (Array.isArray(content)) {
         const hasTools = content.some(block => block.type === 'tool-call');
         // Clear previous candidates on a new tool-request message; never emit
         // its preamble as an answer when a later step fails.
-        record.turns[turn] = {...record.turns[turn], text: hasTools ? '' : boundedText(content
-          .filter(block => block.type === 'text' && typeof block.text === 'string')
-          .map(block => block.text).join('\n').trim())};
+        const text = boundedText(content.filter(block => block.type === 'text' && typeof block.text === 'string')
+          .map(block => block.text).join('\n').trim());
+        if (getPolicy().mirrorMessages === true) {
+          if (text) {
+            if (!await output(id, session, `🤖 ${text}`, expected)) return;
+            record.deliveredMessages ??= []; record.deliveredMessages.push(seq);
+          }
+          record.turns[turn] = {...record.turns[turn], text: ''};
+        } else record.turns[turn] = {...record.turns[turn], text: hasTools ? '' : text};
       }
     } else if (event.type === 'tool/call') {
       // Names are identifiers, not arbitrary free-form progress descriptions.
@@ -278,5 +307,11 @@ export function createSessionWatch({ctx, getPolicy, ensureTopic, send, persist, 
     }
     return idle();
   }
-  return {start, reconcile, refresh: reconcile, idle, drain: idle, dispose};
+  async function recoverBinding(sessionId, chatId) {
+    const key = keyFor(sessionId, chatId);
+    if (state.bindings[key] || confirmedTopics.has(key) || topics.has(key)) throw new Error('Existing or in-flight binding cannot be reset');
+    uncertainTopics.delete(key);
+    await commit(() => { delete state.bindingErrors[key]; });
+  }
+  return {start, reconcile, refresh: reconcile, idle, drain: idle, dispose, recoverBinding};
 }

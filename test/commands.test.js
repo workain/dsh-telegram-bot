@@ -56,6 +56,7 @@ function makeContext(agent) {
         return { accepted: true }
       },
       fork: async () => {
+        agent.operations.push('fork')
         rows.push({ sessionId: 'session-fork', blank: false, running: false })
         workspace.sessionIds.push('fork')
         return { sessionId: 'session-fork' }
@@ -242,12 +243,14 @@ test('/restart in All never creates a session topic', async () => {
   }
 })
 
-test('fork creates one new topic with the requested name', async () => {
+test('/fork is intentionally disabled and never forks the original session', async () => {
   const result = await runScenario([all('hello'), topic(7001, '/fork branch', 400)], 20, 900)
   try {
     const topics = result.calls.filter((call) => call.method === 'createForumTopic')
-    assert.equal(topics.length, 2, 'initial topic plus fork topic')
-    assert.equal(topics[1].body.name, 'branch')
+    assert.equal(topics.length, 1, 'only the original session topic exists')
+    assert.equal(result.agent.operations.includes('fork'), false, 'native fork must not be called')
+    assert.ok(result.calls.some(call => call.method === 'sendMessage' && /Форки.*отключены/.test(call.body.text)), 'explicitly explain that Telegram forks are disabled')
+    assert.equal(result.agent.received.length, 1, '/fork is not forwarded as a prompt')
     assert.equal(result.logs.filter((line) => line.startsWith('W ') && !line.includes('getUpdates failed')).length, 0, result.logs.join('\n'))
   } finally {
     await result.cleanup()

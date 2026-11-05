@@ -38,14 +38,14 @@ window.__ModuleLoader__.load({
       showToolCalls: 'Show tool calls',
       showToolCallsHint: 'Send tool names and arguments as they are called.',
       allowedUsers: 'Allowed users',
-      allowedUsersHint: 'Exactly one numeric Telegram owner ID. Empty or multiple IDs deny access.',
+      allowedUsersHint: 'Trusted operators: numeric Telegram IDs or @usernames, separated by spaces or commas. A username is pinned to its first authenticated user ID. Empty denies access.',
       allowedChats: 'Allowed chats',
       allowedChatsHint: 'Optional numeric private chat ID. Groups and channels are not supported.',
       add: 'Add',
       remove: 'Remove',
       emptyUsers: 'No users added yet.',
       emptyChats: 'No chats added yet.',
-      placeholderUsers: '123456789',
+      placeholderUsers: '123456789, @username',
       placeholderChats: '-1001234567890 or @channel',
       save: 'Save',
       saving: 'Saving…',
@@ -93,14 +93,14 @@ window.__ModuleLoader__.load({
       showToolCalls: 'Показывать tool calls',
       showToolCallsHint: 'Отправлять имя инструмента и аргументы по мере вызова.',
       allowedUsers: 'Разрешённые пользователи',
-      allowedUsersHint: 'Ровно один числовой Telegram ID владельца. Пустой список или несколько ID — доступ закрыт.',
+      allowedUsersHint: 'Доверенные операторы: числовые Telegram ID или @логины через пробел или запятую. Логин закрепляется за первым подтверждённым ID. Пустой список закрывает доступ.',
       allowedChats: 'Разрешённые чаты',
       allowedChatsHint: 'Необязательно: числовой ID личного чата. Группы и каналы не поддерживаются.',
       add: 'Добавить',
       remove: 'Удалить',
       emptyUsers: 'Пользователи пока не добавлены.',
       emptyChats: 'Чаты пока не добавлены.',
-      placeholderUsers: '123456789',
+      placeholderUsers: '123456789, @username',
       placeholderChats: '-1001234567890 или @channel',
       save: 'Сохранить',
       saving: 'Сохранение…',
@@ -356,6 +356,7 @@ window.__ModuleLoader__.load({
       const [allowedChats, setAllowedChats] = React.useState([])
       const [enabled, setEnabled] = React.useState(true)
       const [language, setLanguage] = React.useState('en')
+      const [webBaseUrl, setWebBaseUrl] = React.useState('')
       const [showThinking, setShowThinking] = React.useState(true)
       const [showToolCalls, setShowToolCalls] = React.useState(true)
       const [tokenDraft, setTokenDraft] = React.useState('')
@@ -380,6 +381,7 @@ window.__ModuleLoader__.load({
         setAllowedChats(stringArray(value.allowedChats))
         setEnabled(value.enabled !== false)
         setLanguage(value.language === 'ru' ? 'ru' : 'en')
+        setWebBaseUrl(typeof value.webBaseUrl === 'string' ? value.webBaseUrl : '')
         setShowThinking(value.showThinking !== false)
         setShowToolCalls(value.showToolCalls !== false)
         setInitialized(true)
@@ -411,12 +413,13 @@ window.__ModuleLoader__.load({
       const baseChats = stringArray(value.allowedChats)
       const baseEnabled = value.enabled !== false
       const baseLanguage = value.language === 'ru' ? 'ru' : 'en'
+      const baseWebBaseUrl = typeof value.webBaseUrl === 'string' ? value.webBaseUrl : ''
       const baseShowThinking = value.showThinking !== false
       const baseShowToolCalls = value.showToolCalls !== false
       const dirty =
         initialized &&
         (enabled !== baseEnabled ||
-          language !== baseLanguage ||
+          language !== baseLanguage || webBaseUrl !== baseWebBaseUrl ||
           showThinking !== baseShowThinking ||
           showToolCalls !== baseShowToolCalls ||
           !sameList(allowedUsers, baseUsers) ||
@@ -434,6 +437,7 @@ window.__ModuleLoader__.load({
         setAllowedChats(baseChats)
         setEnabled(baseEnabled)
         setLanguage(baseLanguage)
+        setWebBaseUrl(baseWebBaseUrl)
         setShowThinking(baseShowThinking)
         setShowToolCalls(baseShowToolCalls)
         setTokenDraft('')
@@ -449,6 +453,15 @@ window.__ModuleLoader__.load({
           setNotice(null)
           return
         }
+        if (webBaseUrl.trim()) {
+          try {
+            const url = new URL(webBaseUrl.trim())
+            if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || /[?#@\u0000-\u0020]/.test(webBaseUrl.trim())) throw new Error('Invalid address')
+          } catch {
+            setError(language === 'ru' ? 'Укажи адрес Web без токена, логина, query и fragment.' : 'Use a Web address without credentials, query or fragment.')
+            return
+          }
+        }
         setSaving(true)
         setError(null)
         setNotice(null)
@@ -456,6 +469,7 @@ window.__ModuleLoader__.load({
           const operations = [
             { op: 'set', path: ['enabled'], value: enabled },
             { op: 'set', path: ['language'], value: language },
+            { op: 'set', path: ['webBaseUrl'], value: webBaseUrl.trim() },
             { op: 'set', path: ['showThinking'], value: showThinking },
             { op: 'set', path: ['showToolCalls'], value: showToolCalls },
             { op: 'set', path: ['allowedUsers'], value: allowedUsers },
@@ -578,7 +592,13 @@ window.__ModuleLoader__.load({
               onChange: setEnabled,
             }),
           ),
-          h('p', { className: 'dtb-hint' }, 'Workain: /watch selects projects for automatic topics. Reasoning and tool arguments are never mirrored. Exactly one numeric owner ID; private chats only.'),
+          h('label', { className: 'dtb-label' }, language === 'ru' ? 'Адрес Web DSH для закреплённых ссылок' : 'Web DSH address for pinned links'),
+          h('input', { className: 'dtb-input', value: webBaseUrl, disabled: saving || !writable,
+            'aria-label': 'Web DSH address', placeholder: 'https://your-dsh-host/', onChange: event => setWebBaseUrl(event.target.value) }),
+          h('p', { className: 'dtb-hint' }, language === 'ru'
+            ? 'Без токена и параметров URL. Пусто — локальный адрес DSH. Для телефона нужен доступный вам VPN/прокси-адрес; localhost работает только на машине DSH.'
+            : 'No token or URL parameters. Blank uses the local DSH origin. A phone needs your reachable VPN/proxy address; localhost only works on the DSH machine.'),
+          h('p', { className: 'dtb-hint' }, 'Workain: /watch selects projects for automatic topics. Reasoning and tool arguments are never mirrored. Multiple trusted IDs or @usernames; each private chat keeps its own topics and /watch selection.'),
           h(ListEditor, {
             t,
             label: t('allowedUsers'),
@@ -674,7 +694,7 @@ window.__ModuleLoader__.load({
     }
 
     /** Required client services. */
-    const inject = ['slots', 'locale', 'remote', 'remote.credentials', 'configForms']
+    const inject = ['slots', 'locale', 'remote', 'remote.credentials', 'configForms', 'uiWorkspace', 'sessions']
 
     /**
      * Register the Telegram section while the Host serves this bundle's
@@ -682,6 +702,29 @@ window.__ModuleLoader__.load({
      * @param ctx - the browser plugin context.
      */
     function apply(ctx) {
+      ctx.effect(() => {
+        const url = new URL(window.location.href)
+        const ids = url.searchParams.getAll('dshSession')
+        if (ids.length !== 1 || !ids[0] || ids[0].length > 512 || /\s|\p{Cc}/u.test(ids[0])) return
+        let active = true, opened = false
+        const canonical = id => id.replace(/^session-/, '')
+        const open = () => {
+          if (!active || opened) return
+          const rows = ctx.sessions.list.getSnapshot().byId
+          const target = Object.hasOwn(rows, ids[0]) ? ids[0]
+            : Object.keys(rows).find(id => canonical(id) === canonical(ids[0]))
+          if (!target) return // Native catalog is still arriving; don't race its initial connection.
+          opened = true
+          try {
+            ctx.uiWorkspace.openSession(target)
+            url.searchParams.delete('dshSession')
+            window.history.replaceState(window.history.state, '', url)
+          } catch { opened = false; console.warn('Telegram session link could not be opened') }
+        }
+        const off = ctx.sessions.list.subscribe(open)
+        open()
+        return () => { active = false; off() }
+      }, 'telegram: open linked original session')
       const t = ctx.locale.bind(NS)
       ctx.effect(() => {
         const offEn = ctx.locale.register(NS, 'en', en)

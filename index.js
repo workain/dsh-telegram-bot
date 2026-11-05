@@ -15,7 +15,13 @@ import { basename, join, resolve } from 'node:path'
 import telegramifyMarkdown from 'telegramify-markdown'
 import { createSessionWatch, redactTelegramText } from './session-watch.js'
 import { validatePluginState } from './state-validation.js'
-import { admitPrompt, assertOrdinarySession, createWorkspaceSession, createUpdateAdmission, resolveSessionAgent, stopSession } from './session-api.js'
+import { authorizeUser } from './user-access.js'
+import { selectSessions } from './session-selection.js'
+import { isKnownTelegramRejection, topicSetupError } from './topic-recovery.js'
+import { createSessionHistory } from './session-history.js'
+import { mirrorInteraction } from './mirrored-interaction.js'
+import { createSessionLinkPins } from './session-link.js'
+import { admitPrompt, assertOrdinarySession, createWorkspaceSession, createUpdateAdmission, resolveSessionAgent, sessionRows, stopSession, hasLiveSubagentOwner } from './session-api.js'
 
 /** Loader row id and settings namespace; the npm package name stays dsh-telegram-bot. */
 export const name = 'telegram-bot'
@@ -361,14 +367,16 @@ const BOT_COMMANDS = [
   { command: 'help', description: 'List commands' },
   { command: 'stop', description: 'Stop the current task' },
   { command: 'status', description: 'Bot and session status' },
-  { command: 'sessions', description: 'Browse workspaces and sessions' },
+  { command: 'sessions', description: 'Browse and connect original DSH sessions' },
+  { command: 'connect', description: 'Connect running, hour or day sessions' },
+  { command: 'history', description: 'Recent history; history older loads earlier' },
+  { command: 'retry', description: 'Recover a confirmed missing session topic' },
   { command: 'watch', description: 'Choose projects for automatic Web session topics' },
   { command: 'new', description: 'Create a session in a chosen workspace' },
   { command: 'bind', description: 'Recover an existing topic binding' },
   { command: 'current', description: 'Show the topic session' },
   { command: 'menu', description: 'Show the model and session controls' },
   { command: 'rename', description: 'Rename this Telegram topic' },
-  { command: 'fork', description: 'Fork this session into a new topic' },
   { command: 'last', description: 'Show the latest assistant messages' },
   { command: 'restart', description: 'Restart the Telegram bot runtime' },
   { command: 'id', description: 'Show user and chat ids' },
@@ -381,14 +389,16 @@ const BOT_COMMANDS_RU = [
   { command: 'help', description: 'Список команд' },
   { command: 'stop', description: 'Остановить текущую задачу' },
   { command: 'status', description: 'Статус бота и сессии' },
-  { command: 'sessions', description: 'Выбрать workspace и сессию' },
+  { command: 'sessions', description: 'Подключить исходные сессии DSH' },
+  { command: 'connect', description: 'Подключить сессии: running, hour, day' },
+  { command: 'history', description: 'История; history older — более ранние' },
+  { command: 'retry', description: 'Восстановить отсутствующую тему сессии' },
   { command: 'watch', description: 'Выбрать проекты для автотем Web-сессий' },
   { command: 'new', description: 'Создать сессию в выбранном проекте' },
   { command: 'bind', description: 'Восстановить привязку существующей темы' },
   { command: 'current', description: 'Показать сессию этого топика' },
   { command: 'menu', description: 'Показать меню модели и сессии' },
   { command: 'rename', description: 'Переименовать Telegram-топик' },
-  { command: 'fork', description: 'Форкнуть сессию в новый topic' },
   { command: 'last', description: 'Показать последние ответы ассистента' },
   { command: 'restart', description: 'Перезапустить Telegram-бота' },
   { command: 'id', description: 'Показать user id и chat id' },
@@ -411,6 +421,8 @@ export const Config = z.object({
   enabled: z.boolean().default(true).volatile(),
   /** Language of the bot's Telegram messages. */
   language: z.string().default('en').volatile(),
+  /** Адрес Web DSH для ссылок: без токена, логина, query и fragment. */
+  webBaseUrl: z.string().default('').volatile(),
   /**
    * Telegram user ids or @usernames allowed to talk to the bot.
    * Empty means nobody, except the one-time setup hint described below.
@@ -522,10 +534,8 @@ function allowedChatsOf(config) {
  * @param allowedUsers - configured entries.
  * @returns whether the user may talk to the bot.
  */
-function userAllowed(from, allowedUsers) {
-  if (from === undefined || !Array.isArray(allowedUsers)) return false
-  const ids = allowedUsers.map(String).filter((entry) => /^\d+$/.test(entry))
-  return ids.length === 1 && ids[0] === String(from.id)
+function userAllowed(from, allowedUsers, pins = {}) {
+  return authorizeUser(from, allowedUsers, pins)
 }
 
 /**
@@ -561,6 +571,9 @@ async function loadState() {
       return {
         version: 3,
         subscription: parsed.subscription ?? {},
+        subscriptions: parsed.subscriptions ?? {},
+        watches: parsed.watches ?? {},
+        userPins: parsed.userPins ?? {},
         watch: parsed.watch ?? {},
         updateOffset: parsed.updateOffset ?? 0,
         updateLedger: parsed.updateLedger ?? {},
@@ -604,7 +617,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0-dev.1',
   agentBridge: 'v1',
-  codeRevision: 'bucket-50',
+  codeRevision: 'multi-history-web-mirror-2',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -667,7 +680,7 @@ export function apply(ctx, config) {
   let startEpoch = 0
   /** Durable chat → session mapping. */
   const watchState = { bindings: {}, bindingErrors: {}, sessions: {} }
-  let state = { version: 3, sessions: {}, threads: {}, watch: watchState }
+  let state = { version: 3, sessions: {}, threads: {}, watch: watchState, subscriptions: {}, watches: {}, userPins: {} }
   /** Serializes state-file writes. */
   let stateWrite = Promise.resolve()
   /** Per-chat live bridge state. */
@@ -682,7 +695,15 @@ export function apply(ctx, config) {
   let topics = { chatId: 0 }
   /** Resolves after the mapping and topic files have been read. */
   const stateReady = Promise.all([
-    loadState().then((loaded) => { Object.assign(watchState, loaded.watch ?? {}); state = { ...loaded, watch: watchState } }),
+    loadState().then((loaded) => {
+      Object.assign(watchState, loaded.watch ?? {})
+      state = { ...loaded, watch: watchState, subscriptions: loaded.subscriptions ?? {}, watches: loaded.watches ?? {}, userPins: loaded.userPins ?? {} }
+      const first = state.subscription?.chatId
+      if (first !== undefined) {
+        state.subscriptions[first] = state.subscription
+        state.watches[first] = watchState
+      }
+    }),
     loadTopics().then((loaded) => { topics = loaded }),
   ])
 
@@ -700,84 +721,221 @@ export function apply(ctx, config) {
     return stateWrite
   }
 
-  function watchPolicy() {
-    const owner = state.subscription ?? {}
+  // Legacy sid keys belong to the first chat; other chats never replace them.
+  function recordKey(sessionId, chatId) {
+    const legacy = state.sessions[sessionId]
+    if (legacy?.chatId === chatId || (!legacy && state.subscription?.chatId === chatId)) return sessionId
+    return JSON.stringify([chatId, sessionId])
+  }
+  function sessionRecord(sessionId, chatId) { return state.sessions[recordKey(sessionId, chatId)] }
+  function subscriptionFor(chatId) { return state.subscriptions?.[chatId] ?? {} }
+  function watchStateFor(chatId) {
+    return state.watches[chatId] ??= { bindings: {}, bindingErrors: {}, sessions: {} }
+  }
+  function watchPolicy(chatId) {
+    const owner = subscriptionFor(chatId)
     return {
       enabled: isEnabled(config) && me !== undefined && !owner.paused,
-      allowed: userAllowed({ id: owner.userId }, allowedUsersOf(config))
+      allowed: userAllowed({ id: owner.userId }, allowedUsersOf(config), state.userPins)
         && chatAllowed({ id: owner.chatId, type: 'private' }, allowedChatsOf(config)),
       chatId: owner.chatId,
       workspaceIds: owner.workspaceIds ?? [],
       generation: (owner.generation ?? 0) + startEpoch,
+      mirrorMessages: true,
+      historyThroughSeqs: Object.fromEntries(Object.values(state.sessions).filter(record => record.chatId === chatId && Math.max(record.historyThroughSeq ?? -1, record.history?.throughSeq ?? -1) >= 0).map(record => [record.sessionId, Math.max(record.historyThroughSeq ?? -1, record.history?.throughSeq ?? -1)])),
       boundSessionIds: Object.values(state.sessions).filter((record) => record.chatId === owner.chatId).map((record) => record.sessionId),
     }
   }
 
-  async function claimOwner(from, chat) {
-    await stateReady
-    if (state.subscription?.userId !== from.id || state.subscription?.chatId !== chat.id) {
-      releaseInteractions()
-      state.subscription = { userId: from.id, chatId: chat.id, workspaceIds: [], paused: false, generation: (state.subscription?.generation ?? 0) + 1 }
-      state.sessions = {}
-      state.threads = {}
-      Object.assign(watchState, { bindings: {}, bindingErrors: {}, sessions: {} })
-      state.watch = watchState
-      chats.clear()
-      await persistState()
+  function bindingEligible(sessionId) {
+    const registry = ctx.get('workspaceRegistry')
+    const key = id => typeof id === 'string' ? id.replace(/^session-/, '') : ''
+    const id = key(sessionId)
+    return Boolean(id && registry?.list().some(workspace => workspace.sessionIds.some(value => key(value) === id))
+      && !(registry.archivedSessionIds ?? []).some(value => key(value) === id)
+      && !hasLiveSubagentOwner(ctx, sessionId))
+  }
+  function historyAllowed(chat) {
+    const policy = watchPolicy(chat.chatId)
+    return policy.enabled && policy.allowed && policy.generation === chat.generation
+      && state.threads[`${chat.chatId}:${chat.threadId}`] === chat.sessionId && bindingEligible(chat.sessionId)
+  }
+  const sessionHistory = createSessionHistory({
+    ctx,
+    getBinding: chat => sessionRecord(chat.sessionId, chat.chatId),
+    getState: chat => {
+      const record = sessionRecord(chat.sessionId, chat.chatId)
+      if (record.history?.format !== 'separate-v1') record.history = { format: 'separate-v1' }
+      return record.history
+    },
+    isAllowed: historyAllowed,
+    isLiveDelivered: (chat, seq) => watchStateFor(chat.chatId).sessions[chat.sessionId]?.deliveredMessages?.includes(seq) === true,
+    persist: persistState,
+    send: async (chat, text) => {
+      for (const chunk of splitTelegramText(text)) {
+        if (!historyAllowed(chat)) throw new Error('History access changed')
+        await call('sendMessage', { chat_id: chat.chatId, message_thread_id: chat.threadId, text: chunk }, bridgeAbort.signal, 30_000, chat.generation)
+      }
+    },
+  })
+  async function sendHistoryPage(record, older, signal) {
+    const chat = { chatId: record.chatId, threadId: record.threadId, sessionId: record.sessionId, generation: watchPolicy(record.chatId).generation }
+    const result = await (older ? sessionHistory.older(chat, signal) : sessionHistory.recent(chat, signal))
+    if (!historyAllowed(chat)) return
+    if (Number.isSafeInteger(result.throughSeq)) record.historyThroughSeq = result.throughSeq
+    await persistState()
+    if (result.hasMore && (older || result.initial || result.sent > 0)) await sendKeyboard(chat.chatId, chat.threadId,
+      'История загружена. Более ранние сообщения можно загрузить следующей порцией (они появятся ниже, с отметками времени).',
+      [[{ text: '⬆️ Загрузить более ранние сообщения', callback_data: `h:${chat.sessionId}` }]], signal, chat.generation)
+    else if (older && result.sent === 0) await sendPlain(chat.chatId, 'Начало истории: более ранних сообщений нет.', signal, chat.threadId)
+    return result
+  }
+  const linkPinServices = new Map()
+  async function ensureSessionLinkPin(record, signal) {
+    const generation = watchPolicy(record.chatId).generation
+    const key = `${record.chatId}:${generation}`
+    if (!linkPinServices.has(key)) linkPinServices.set(key, createSessionLinkPins({
+      getBinding: (chatId, sessionId) => sessionRecord(sessionId, chatId),
+      isAllowed: binding => {
+        const policy = watchPolicy(binding.chatId)
+        return policy.enabled && policy.allowed && policy.generation === generation
+          && state.threads[`${binding.chatId}:${binding.threadId}`] === binding.sessionId && bindingEligible(binding.sessionId)
+      },
+      getBaseUrl: () => readLive(config.webBaseUrl, '') || ctx.get('webServer')?.getOrigin?.() || '',
+      call: (method, payload, requestSignal) => call(method, payload, requestSignal, 30_000, generation),
+      persist: persistState,
+    }))
+    return linkPinServices.get(key).ensure(record, signal)
+  }
+  async function seedHistory(record, signal) {
+    try { await assertOrdinarySession(ctx, record.sessionId, signal) } catch { return }
+    try { await ensureSessionLinkPin(record, signal) }
+    catch (error) { await sendPlain(record.chatId, `Ссылка в закрепе пока недоступна: ${messageOf(error)}`, signal, record.threadId) }
+    try { await sendHistoryPage(record, false, signal) }
+    catch (error) {
+      // A history failure must not discard a successfully created topic.
+      await sendPlain(record.chatId, `История пока не загружена: ${messageOf(error)}. Повтор: /history в этой теме.`, signal, record.threadId)
     }
   }
 
-  const sessionWatch = createSessionWatch({
-    ctx, getPolicy: watchPolicy,
-    getState: () => watchState, persist: persistState,
-    ensureTopic: async (sessionId, chatId) => {
-      const record = await ensureBoundTopic(sessionId, chatId, bridgeAbort.signal)
-      return record
+  async function authenticateIncoming(from, chat) {
+    await stateReady
+    if (!chatAllowed(chat ?? {}, allowedChatsOf(config))) return false
+    const before = JSON.stringify(state.userPins)
+    const allowed = authorizeUser(from, allowedUsersOf(config), state.userPins, { claim: true })
+    // A learned username identity must be durable before any operation or reply.
+    if (JSON.stringify(state.userPins) !== before) await persistState()
+    return allowed
+  }
+
+  async function claimOwner(from, chat) {
+    await stateReady
+    if (!state.subscriptions[chat.id]) {
+      const owner = { userId: from.id, chatId: chat.id, workspaceIds: [], paused: false, generation: 1 }
+      state.subscriptions[chat.id] = owner
+      if (state.subscription?.chatId === undefined) {
+        state.subscription = owner
+        state.watches[chat.id] = watchState
+      } else watchStateFor(chat.id)
+      await persistState()
+    }
+    if (watchersStarted) await watcherFor(chat.id).start()
+  }
+
+  const watchers = new Map()
+  let watchersStarted = false
+  function watcherFor(chatId) {
+    if (!watchers.has(chatId)) watchers.set(chatId, createSessionWatch({
+      ctx, getPolicy: () => watchPolicy(chatId),
+      getState: () => watchStateFor(chatId), persist: persistState,
+      ensureTopic: (sessionId) => ensureBoundTopic(sessionId, chatId, bridgeAbort.signal),
+      send: async (chat, text) => {
+        const generation = watchPolicy(chatId).generation
+        for (const chunk of splitTelegramText(text)) {
+          const policy = watchPolicy(chatId)
+          if (!policy.enabled || !policy.allowed || policy.generation !== generation) return
+          await call('sendMessage', { chat_id: chat.chatId, message_thread_id: chat.threadId, text: chunk }, bridgeAbort.signal, 30_000, generation)
+        }
+      },
+      onError: () => warn('Session delivery paused or failed; check Telegram status and /watch.'),
+    }))
+    return watchers.get(chatId)
+  }
+  const sessionWatch = {
+    async start() {
+      await stateReady
+      watchersStarted = true
+      await Promise.all(Object.values(state.subscriptions).map(owner => watcherFor(owner.chatId).start()))
+      fireAndForget('history-startup', async () => {
+        for (const record of Object.values(state.sessions)) {
+          const policy = watchPolicy(record.chatId)
+          if (policy.enabled && policy.allowed) await seedHistory(record, bridgeAbort.signal)
+        }
+      })
     },
-    send: async (chat, text) => {
-      const generation = watchPolicy().generation
-      for (const chunk of splitTelegramText(text)) {
-        if (!watchPolicy().enabled || !watchPolicy().allowed || watchPolicy().generation !== generation) return
-        await call('sendMessage', { chat_id: chat.chatId, message_thread_id: chat.threadId, text: chunk }, bridgeAbort.signal, 30_000, generation)
-      }
+    async reconcile(chatId) {
+      if (chatId !== undefined) return watcherFor(chatId).reconcile()
+      await Promise.all(Object.values(state.subscriptions).map(owner => watcherFor(owner.chatId).reconcile()))
     },
-    onError: () => warn('Session delivery paused or failed; check Telegram status and /watch.'),
-  })
+    dispose() { for (const watcher of watchers.values()) watcher.dispose() },
+  }
+  const lastSenderChats = new Map()
 
   ctx.on('session/event', (session, event) => {
-    if (event.type !== 'session/title' || !watchPolicy().enabled || !watchPolicy().allowed) return
-    const record = state.sessions[session.id]
-    if (!record || record.chatId !== watchPolicy().chatId) return
-    fireAndForget('topic-title', async () => {
-      const chat = await chatFor(record.chatId, record.threadId)
-      await applyTopicTitle(chat, event.data?.title)
-    })
+    if (event.type !== 'session/title') return
+    for (const record of Object.values(state.sessions)) {
+      const policy = watchPolicy(record.chatId)
+      if (record.sessionId !== session.id || !policy.enabled || !policy.allowed) continue
+      fireAndForget('topic-title', async () => {
+        const chat = await chatFor(record.chatId, record.threadId)
+        await applyTopicTitle(chat, event.data?.title)
+      })
+    }
   })
 
   // Own foreground questions only for explicitly bound, authorized sessions.
   // Never await topic creation in an approval boundary or resurrect cold agents.
   async function questionChat(agent) {
-    if (!agent || !watchPolicy().enabled || !watchPolicy().allowed) return undefined
-    const generation = watchPolicy().generation
+    if (!agent) return undefined
     const id = agent.session?.id
-    const record = state.sessions[id]
-    if (!record || record.sessionId !== id || record.chatId !== state.subscription?.chatId
-      || !Number.isSafeInteger(record.threadId) || state.threads[`${record.chatId}:${record.threadId}`] !== id) return undefined
+    const candidates = Object.values(state.sessions).filter(record => record.sessionId === id)
+    const preferred = lastSenderChats.get(id)
+    candidates.sort((a, b) => Number(b.chatId === preferred) - Number(a.chatId === preferred))
+    const record = candidates.find(record => {
+      const policy = watchPolicy(record.chatId)
+      return policy.enabled && policy.allowed && Number.isSafeInteger(record.threadId)
+        && state.threads[`${record.chatId}:${record.threadId}`] === id
+    })
+    if (!record) return undefined
+    const generation = watchPolicy(record.chatId).generation
     try { await assertOrdinarySession(ctx, id, bridgeAbort.signal) } catch { return undefined }
     const chat = await chatFor(record.chatId, record.threadId)
-    if (!watchPolicy().enabled || !watchPolicy().allowed || watchPolicy().generation !== generation) return undefined
+    const policy = watchPolicy(record.chatId)
+    if (!policy.enabled || !policy.allowed || policy.generation !== generation) return undefined
     chat.boundAgent = agent
     return chat
   }
-  ctx.on('approval/request', async (req, next) => {
-    const chat = await questionChat(req.agent)
-    if (!chat) return next()
-    return requestApproval(req.agent, chat, req, next)
+  function hasQuestionTopic(agent) {
+    return agent && Object.values(state.sessions).some(record => {
+      const policy = watchPolicy(record.chatId)
+      return record.sessionId === agent.session?.id && policy.enabled && policy.allowed
+    })
+  }
+  ctx.on('approval/request', (req, next) => {
+    if (!hasQuestionTopic(req.agent)) return next()
+    return mirrorInteraction({ request: req, next, kind: 'approval', telegram: async telegramRequest => {
+      const chat = await questionChat(req.agent)
+      if (!chat) return 'unavailable'
+      return requestApproval(req.agent, chat, telegramRequest, () => Promise.resolve('unavailable'))
+    } })
   }, { prepend: true })
-  ctx.on('user-questions/request', async (req, next) => {
-    const chat = await questionChat(req.agent)
-    if (!chat) return next()
-    return requestUserQuestions(req.agent, chat, req, next)
+  ctx.on('user-questions/request', (req, next) => {
+    if (!hasQuestionTopic(req.agent)) return next()
+    return mirrorInteraction({ request: req, next, kind: 'question', telegram: async telegramRequest => {
+      const chat = await questionChat(req.agent)
+      if (!chat) throw new Error('Telegram question channel unavailable')
+      return requestUserQuestions(req.agent, chat, telegramRequest, () => Promise.reject(new Error('Telegram question channel unavailable')))
+    } })
   }, { prepend: true })
 
   /**
@@ -796,9 +954,9 @@ export function apply(ctx, config) {
         chatId,
         threadId,
         sessionId: boundSession,
-        cwd: boundSession === undefined ? undefined : state.sessions[boundSession]?.cwd,
+        cwd: boundSession === undefined ? undefined : sessionRecord(boundSession, chatId)?.cwd,
         selection: undefined,
-        permission: boundSession === undefined ? undefined : state.sessions[boundSession]?.permission,
+        permission: boundSession === undefined ? undefined : sessionRecord(boundSession, chatId)?.permission,
         busy: false,
         done: true,
         turnSource: undefined,
@@ -833,7 +991,7 @@ export function apply(ctx, config) {
    * @param title - display title.
    */
   async function bindSession(chat, sessionId, title, cwd) {
-    const prior = state.sessions[sessionId]
+    const prior = sessionRecord(sessionId, chat.chatId)
     if ((prior && (prior.chatId !== chat.chatId || prior.threadId !== chat.threadId))
       || (state.threads[chat.key] && state.threads[chat.key] !== sessionId)) {
       throw new Error('Topic reassignment is not supported. Open a separate session topic with /sessions.')
@@ -841,12 +999,13 @@ export function apply(ctx, config) {
     chat.sessionId = sessionId
     if (typeof cwd === 'string' && cwd.length > 0) chat.cwd = cwd
     state.threads[chat.key] = sessionId
-    state.sessions[sessionId] = {
+    state.sessions[recordKey(sessionId, chat.chatId)] = {
+      ...prior,
       sessionId,
       chatId: chat.chatId,
       threadId: chat.threadId,
-      title: title ?? state.sessions[sessionId]?.title ?? '',
-      ...(state.sessions[sessionId]?.titleLocked === true ? { titleLocked: true } : {}),
+      title: title ?? prior?.title ?? '',
+      ...(prior?.titleLocked === true ? { titleLocked: true } : {}),
       ...(chat.cwd === undefined ? {} : { cwd: chat.cwd }),
       ...(chat.selection?.current?.model === undefined ? {} : { model: chat.selection.current.model }),
       ...(chat.selection?.current?.reasoningEffort === undefined ? {} : { effort: chat.selection.current.reasoningEffort }),
@@ -900,7 +1059,7 @@ export function apply(ctx, config) {
    */
   function selectionForChat(chat) {
     if (chat.selection !== undefined) return chat.selection
-    const record = typeof chat.sessionId === 'string' ? state.sessions[chat.sessionId] : undefined
+    const record = typeof chat.sessionId === 'string' ? sessionRecord(chat.sessionId, chat.chatId) : undefined
     const fallback = modelSelection()
     const provider = record?.provider ?? fallback?.provider ?? 'deepseek-official'
     const model = record?.model ?? fallback?.model ?? 'deepseek-flash'
@@ -922,7 +1081,7 @@ export function apply(ctx, config) {
    */
   async function hydrateSelection(chat) {
     if (chat.selection !== undefined) return
-    const record = typeof chat.sessionId === 'string' ? state.sessions[chat.sessionId] : undefined
+    const record = typeof chat.sessionId === 'string' ? sessionRecord(chat.sessionId, chat.chatId) : undefined
     let provider = record?.provider
     let model = record?.model
     let effort = record?.effort
@@ -1122,7 +1281,7 @@ export function apply(ctx, config) {
    */
   async function persistPreferences(chat) {
     if (typeof chat.sessionId !== 'string') return
-    const record = state.sessions[chat.sessionId]
+    const record = sessionRecord(chat.sessionId, chat.chatId)
     if (record === undefined) return
     const current = chat.selection?.current
     if (current !== undefined) {
@@ -1387,10 +1546,12 @@ export function apply(ctx, config) {
     for (let attempt = 0; attempt < targets.length + 4; attempt += 1) {
       const target = targets[attempt % targets.length]
       try {
-        if (payload?.chat_id !== undefined && state.subscription?.userId !== undefined) {
-          const policy = watchPolicy()
-          if (!policy.allowed || policy.chatId !== payload.chat_id || !isEnabled(config)
-            || (expectedGeneration !== undefined && (!policy.enabled || policy.generation !== expectedGeneration))) throw new Error('Telegram owner access revoked')
+        if (payload?.chat_id !== undefined) {
+          const policy = watchPolicy(payload.chat_id)
+          const setupHint = allowedUsersOf(config).length === 0 && Object.keys(state.subscriptions).length === 0
+            && Object.keys(state.sessions).length === 0 && method === 'sendMessage'
+          if (!setupHint && (!policy.allowed || policy.chatId !== payload.chat_id || !isEnabled(config)
+            || (expectedGeneration !== undefined && (!policy.enabled || policy.generation !== expectedGeneration)))) throw new Error('Telegram owner access revoked')
         }
         return await requestOnce(target, token, method, body, signal, timeoutMs)
       } catch (error) {
@@ -1461,6 +1622,7 @@ export function apply(ctx, config) {
           if (parsed?.ok !== true) {
             const error = new Error(parsed?.description ?? `Telegram API HTTP ${response.statusCode}`)
             error.telegram = true
+            error.telegramCode = parsed?.error_code
             if (typeof parsed?.parameters?.retry_after === 'number') {
               error.retryAfter = parsed.parameters.retry_after
             }
@@ -1826,11 +1988,11 @@ export function apply(ctx, config) {
   /** Pending structured user questions keyed by short callback id. */
   const pendingQuestions = new Map()
   function interactionIdentity(chat) {
-    return { chatId: chat.chatId, threadId: chat.threadId, sessionId: chat.sessionId, bindingGeneration: watchPolicy().generation }
+    return { chatId: chat.chatId, threadId: chat.threadId, sessionId: chat.sessionId, bindingGeneration: watchPolicy(chat.chatId).generation }
   }
   function validInteraction(pending) {
-    const policy = watchPolicy()
-    const record = state.sessions[pending.sessionId]
+    const policy = watchPolicy(pending.chatId)
+    const record = sessionRecord(pending.sessionId, pending.chatId)
     return policy.enabled && policy.allowed && policy.chatId === pending.chatId
       && policy.generation === pending.bindingGeneration
       && state.threads[`${pending.chatId}:${pending.threadId}`] === pending.sessionId
@@ -1858,7 +2020,9 @@ export function apply(ctx, config) {
     pendingApprovals.delete(id)
     pending.signal?.removeEventListener('abort', pending.onAbort)
     pending.resolve(outcome)
-    const label = outcome === 'allowed-once'
+    const label = pending.signal?.reason?.code === 'MIRROR_SETTLED' && pending.signal.reason.channel === 'web'
+      ? tr('✅ Answered in Web', '✅ Ответ получен в Web')
+      : outcome === 'allowed-once'
       ? tr('✅ Allowed', '✅ Разрешено')
       : outcome === 'rejected'
         ? tr('❌ Denied', '❌ Отклонено')
@@ -2121,7 +2285,9 @@ export function apply(ctx, config) {
           pending.chatId,
           pending.threadId,
           pending.messageId,
-          `⏹ **${tr('Question cancelled', 'Вопрос отменён')}**`,
+          signal.reason?.code === 'MIRROR_SETTLED' && signal.reason.channel === 'web'
+            ? `✅ **${tr('Answered in Web', 'Ответ получен в Web')}**`
+            : `⏹ **${tr('Question cancelled', 'Вопрос отменён')}**`,
           [],
           bridgeAbort.signal,
         ))
@@ -2597,7 +2763,7 @@ export function apply(ctx, config) {
   async function applyTopicTitle(chat, title) {
     if (typeof title !== 'string' || title.trim().length === 0) return
     if (typeof chat.sessionId !== 'string' || chat.threadId === undefined) return
-    const record = state.sessions[chat.sessionId]
+    const record = sessionRecord(chat.sessionId, chat.chatId)
     if (record?.titleLocked === true) return
     const clean = title.trim()
     if (record !== undefined && record.title === clean) return
@@ -2619,7 +2785,7 @@ export function apply(ctx, config) {
 
   async function refreshTopicTitle(chat) {
     if (typeof chat.sessionId !== 'string' || chat.threadId === undefined) return
-    const record = state.sessions[chat.sessionId]
+    const record = sessionRecord(chat.sessionId, chat.chatId)
     if (record?.titleLocked === true) return
     // Read the current title once. The title provider's later session/title
     // event updates the topic without timers or retry loops.
@@ -2726,6 +2892,7 @@ export function apply(ctx, config) {
    */
   async function runAgent(chat, text, signal, attachments = []) {
     await ensureAgent(chat)
+    lastSenderChats.set(chat.sessionId, chat.chatId)
     await admitPrompt(ctx, {
       sessionId: chat.sessionId, chatId: chat.chatId, messageId: incomingMessageId,
       text, attachments,
@@ -3042,7 +3209,7 @@ export function apply(ctx, config) {
         const message = messageOf(error).toLowerCase()
         if (message.includes('duplicate') || message.includes('already')) continue
         if (message.includes('forum') || message.includes('topic')) {
-          throw new Error(tr('Enable Threaded mode in @BotFather → Bot Settings, then enable Topics in the bot chat (tap the bot name → Topics).', 'Включи Threaded mode в @BotFather → Bot Settings, затем включи Topics в чате с ботом (имя бота сверху → Topics).'))
+          throw topicSetupError(error, tr('Enable Threaded mode in @BotFather → Bot Settings, then enable Topics in the bot chat (tap the bot name → Topics).', 'Включи Threaded mode в @BotFather → Bot Settings, затем включи Topics в чате с ботом (имя бота сверху → Topics).'))
         }
         throw error
       }
@@ -3160,8 +3327,8 @@ export function apply(ctx, config) {
    */
   async function openTopicForSession(sessionId, chatId, signal) {
     const record = await ensureBoundTopic(sessionId, chatId, signal)
-    await sendPlain(chatId, tr('Session connected. New progress and results will appear here; /last explicitly requests history.', 'Сессия подключена. Здесь будут новые события и результаты; /last явно запрашивает историю.'), signal, record.threadId)
-    await sessionWatch.reconcile()
+    await sendPlain(chatId, tr('Same DSH session connected. Recent history and new messages appear here. /history older loads earlier messages.', 'Подключена та же сессия DSH. Здесь история за последний час и новые сообщения. /history older загрузит более ранние.'), signal, record.threadId)
+    await sessionWatch.reconcile(chatId)
     return record
   }
 
@@ -3170,23 +3337,28 @@ export function apply(ctx, config) {
     if (openingTopics.has(key)) return openingTopics.get(key)
     const opening = (async () => {
       const { row } = await assertOrdinarySession(ctx, sessionId, signal)
-      const existing = state.sessions[sessionId]
-      if (existing?.chatId === chatId && Number.isSafeInteger(existing.threadId)) return existing
-      if (!watchPolicy().enabled || !watchPolicy().allowed || watchPolicy().chatId !== chatId) throw new Error('Telegram subscription unavailable')
+      const existing = sessionRecord(sessionId, chatId)
+      if (existing?.chatId === chatId && Number.isSafeInteger(existing.threadId)) { await seedHistory(existing, signal); return existing }
+      if (!watchPolicy(chatId).enabled || !watchPolicy(chatId).allowed) throw new Error('Telegram subscription unavailable')
       state.topicAttempts ??= {}
       if (state.topicAttempts[key]) throw new Error('Topic creation outcome unknown. Inspect Telegram and use /bind in the existing topic.')
       const title = await sessionTitle(sessionId)
       state.topicAttempts[key] = 'pending'
       await persistState()
       // Never auto-retry a potentially accepted createForumTopic after timeout.
-      const threadId = await createTopic(chatId, title, signal)
+      let threadId
+      try { threadId = await createTopic(chatId, title, signal) }
+      catch (error) {
+        if (isKnownTelegramRejection(error)) { delete state.topicAttempts[key]; await persistState() }
+        throw error
+      }
       if (!Number.isSafeInteger(threadId)) throw new Error('Telegram returned no topic identity')
-      if (state.subscription?.chatId !== chatId) throw new Error('Topic created for a previous owner; reconcile before retrying')
       const record = { sessionId, chatId, threadId, title, cwd: row.cwd, updatedAt: Date.now() }
-      state.sessions[sessionId] = record
+      state.sessions[recordKey(sessionId, chatId)] = record
       state.threads[`${chatId}:${threadId}`] = sessionId
       delete state.topicAttempts[key]
       await persistState()
+      await seedHistory(record, signal)
       return record
     })()
     openingTopics.set(key, opening)
@@ -3215,7 +3387,7 @@ export function apply(ctx, config) {
       ...(header?.cwd === undefined ? {} : { cwd: header.cwd }),
       updatedAt: Date.now(),
     }
-    state.sessions[sessionId] = record
+    state.sessions[recordKey(sessionId, chatId)] = record
     state.threads[`${chatId}:${threadId}`] = sessionId
     await persistState()
     forgetChatState(chatId, threadId)
@@ -3272,6 +3444,37 @@ export function apply(ctx, config) {
    * @param threadId - control topic thread.
    * @param signal - request lifetime.
    */
+  function bulkButtons(workspaceRef = 'all') {
+    return [
+      [{ text: '➕ Подключить работающие сейчас', callback_data: `t:running:${workspaceRef}` }],
+      [{ text: '➕ Активные за последний час', callback_data: `t:hour:${workspaceRef}` }],
+      [{ text: '➕ Активные за последние сутки', callback_data: `t:day:${workspaceRef}` }],
+    ]
+  }
+
+  async function connectRecent(chatId, threadId, range, workspaceRef, signal) {
+    if (!['running', 'hour', 'day'].includes(range)) throw new Error('Unknown session selection')
+    const registry = ctx.get('workspaceRegistry')
+    const selected = selectSessions({ rows: await sessionRows(ctx, signal), workspaces: registry?.list() ?? [],
+      archivedSessionIds: registry?.archivedSessionIds ?? [], workspaceId: workspaceRef === 'all' ? undefined : workspaceRef,
+      range, now: Date.now() })
+    await sendPlain(chatId, `Найдено сессий: ${selected.length}. Подключаю исходные диалоги без форков, с историей за последний час.`, signal, threadId)
+    let connected = 0, failed = 0
+    for (const row of selected) {
+      if (signal.aborted || !watchPolicy(chatId).allowed) break
+      try { await ensureBoundTopic(row.sessionId, chatId, signal); connected++ }
+      catch (error) {
+        failed++
+        if (connected === 0) {
+          await sendPlain(chatId, `Не удалось подключить тему: ${messageOf(error)}. Остальные не создаю до исправления.`, signal, threadId)
+          break
+        }
+      }
+    }
+    await sessionWatch.reconcile(chatId)
+    await sendPlain(chatId, `Подключено: ${connected}. Ошибок: ${failed}. Новые сообщения и результаты идут в те же сессии DSH.`, signal, threadId)
+  }
+
   async function showWorkspaces(chatId, threadId, signal, messageId) {
     const registry = ctx.get('workspaceRegistry')
     const workspaces = registry === undefined ? [] : registry.list()
@@ -3279,6 +3482,7 @@ export function apply(ctx, config) {
       text: `📁 ${shortLabel(workspace.title || workspace.path, 44)}`,
       callback_data: `w:${workspace.id}`,
     }])
+    rows.unshift(...bulkButtons())
     rows.push([{ text: tr('🌐 All sessions', '🌐 Все сессии'), callback_data: 'w:all' }])
     await renderMenu(
       chatId,
@@ -3298,32 +3502,20 @@ export function apply(ctx, config) {
    * @param signal - request lifetime.
    */
   async function showSessions(chatId, threadId, workspaceRef, signal, messageId) {
-    const query = ctx.get('sessionQuery')
-    if (query === undefined) {
-      await send(chatId, tr('sessionQuery is unavailable in this profile.', 'sessionQuery недоступен в этом профиле.'), signal, threadId)
-      return
-    }
     const registry = ctx.get('workspaceRegistry')
     const workspace = workspaceRef === 'all' || workspaceRef === undefined ? undefined : registry?.get(workspaceRef)
-    const archived = new Set(registry?.archivedSessionIds ?? [])
-    const records = await query.listSessions(signal)
-    const matching = records
-      .filter((record) => !archived.has(record.header.id))
-      .filter((record) => record.header?.origin !== 'subagent')
-      .filter((record) => workspace === undefined
-        || workspace.sessionIds.includes(record.header.id)
-        || record.header.cwd === workspace.path)
-      .sort((left, right) => (right.header.createdAt ?? 0) - (left.header.createdAt ?? 0))
-      .slice(0, 12)
-    const rows = []
+    const matching = selectSessions({ rows: await sessionRows(ctx, signal), workspaces: registry?.list() ?? [],
+      archivedSessionIds: registry?.archivedSessionIds ?? [], workspaceId: workspaceRef === 'all' ? undefined : workspaceRef,
+      range: 'all', now: Date.now() })
+    const rows = bulkButtons(workspaceRef)
     if (workspace !== undefined) {
       rows.push([{ text: tr('➕ New session in this workspace', '➕ Новая сессия в этом workspace'), callback_data: `n:${workspace.id}` }])
     }
-    for (const record of matching) {
-      const title = await sessionTitle(record.header.id, record.header)
+    for (const record of matching.slice(0, 12)) {
+      const title = await sessionTitle(record.sessionId, record)
       rows.push([{
-        text: `${record.live ? '🟢' : '⚪'} ${shortLabel(title, 44)}`,
-        callback_data: `s:${record.header.id}`,
+        text: `${record.running ? '▶️' : '💬'} ${shortLabel(title, 44)}`,
+        callback_data: `s:${record.sessionId}`,
       }])
     }
     rows.push([{ text: tr('⬅️ Back', '⬅️ Назад'), callback_data: 'w:root' }])
@@ -3389,7 +3581,7 @@ export function apply(ctx, config) {
     if (chat === undefined || from === undefined) return
     const data = String(query.data ?? '')
     await publishStatus({ lastCallback: data, lastCallbackAt: Date.now() })
-    if (!userAllowed(from, allowedUsersOf(config)) || !chatAllowed(chat, allowedChatsOf(config))) {
+    if (!userAllowed(from, allowedUsersOf(config), state.userPins) || !chatAllowed(chat, allowedChatsOf(config))) {
       await call('answerCallbackQuery', { callback_query_id: query.id, text: tr('Access denied', 'Нет доступа'), show_alert: true }, signal, 5000).catch(() => {})
       return
     }
@@ -3470,14 +3662,43 @@ export function apply(ctx, config) {
         await sendMenu(chat.id, threadId, chatState, signal, query.message.message_id)
         return
       }
+      if (prefix === 'h') {
+        const record = sessionRecord(ref, chat.id)
+        if (!record || record.threadId !== threadId) throw new Error('Загружать историю можно только в теме этой сессии')
+        await assertOrdinarySession(ctx, ref, signal)
+        await sendHistoryPage(record, true, signal)
+        return
+      }
+      if (prefix === 'r') {
+        await assertOrdinarySession(ctx, ref, signal)
+        if (sessionRecord(ref, chat.id)) {
+          await sendPlain(chat.id, 'Эта сессия уже привязана. Существующую тему не пересоздаю.', signal, threadId)
+          return
+        }
+        // This button explicitly confirms the user inspected Telegram and found no topic.
+        await watcherFor(chat.id).recoverBinding(ref, chat.id)
+        delete state.topicAttempts?.[`${chat.id}:${ref}`]
+        await persistState()
+        await openTopicForSession(ref, chat.id, signal)
+        return
+      }
+      if (prefix === 't') {
+        const split = ref.indexOf(':')
+        await connectRecent(chat.id, threadId, ref.slice(0, split), ref.slice(split + 1) || 'all', signal)
+        return
+      }
       if (prefix === 'w') {
         if (ref === 'root') await showWorkspaces(chat.id, threadId, signal, query.message.message_id)
         else if (ref === 'all') await showSessions(chat.id, threadId, 'all', signal, query.message.message_id)
         else await showSessions(chat.id, threadId, ref, signal, query.message.message_id)
         return
       }
-      if (prefix === 's') {
-        await showSessionPreview(chat.id, threadId, ref, 'all', signal, query.message.message_id)
+      if (['s', 'c', 'f'].includes(prefix)) {
+        // Old Continue/Fork buttons also open the exact original session.
+        const record = await openTopicForSession(ref, chat.id, signal)
+        await editKeyboard(chat.id, threadId, query.message.message_id,
+          `✅ ${tr('Same DSH session connected', 'Подключена та же сессия DSH')}: ${escapeHtml(record.title || ref)}`,
+          [], signal)
         return
       }
       if (prefix === 'n') {
@@ -3624,7 +3845,7 @@ export function apply(ctx, config) {
     let allowedUser
     let allowedChat
     try {
-      allowedUser = userAllowed(from, allowedUsers)
+      allowedUser = await authenticateIncoming(from, chat)
       allowedChat = chatAllowed(chat, allowedChats)
     } catch (error) {
       await publishStatus({ lastOutcome: 'handler-error', detail: messageOf(error) })
@@ -3751,30 +3972,50 @@ export function apply(ctx, config) {
     }
 
 
+    if (command === '/history') {
+      if (!inSession) { await sendPlain(chat.id, 'Открой тему сессии и отправь /history или /history older.', signal, threadId); return }
+      await assertOrdinarySession(ctx, chatState.sessionId, signal)
+      await sendHistoryPage(sessionRecord(chatState.sessionId, chat.id), parts[1] === 'older', signal)
+      return
+    }
+    if (command === '/retry') {
+      const sessionId = parts[1]
+      if (!sessionId) { await sendPlain(chat.id, '/retry <session-id> — только после проверки, что темы действительно нет.', signal, threadId); return }
+      await assertOrdinarySession(ctx, sessionId, signal)
+      await sendKeyboard(chat.id, threadId,
+        'Предыдущая попытка не подтверждена. Проверь Telegram: если тема уже есть, не создавай вторую — используй /bind в ней. Повторное создание допустимо только если темы нет.',
+        [[{ text: 'Подтверждаю: темы нет — создать снова', callback_data: `r:${sessionId}` }]], signal)
+      return
+    }
+    if (command === '/connect') {
+      await connectRecent(chat.id, threadId, parts[1] ?? 'running', parts[2] ?? 'all', signal)
+      return
+    }
     if (command === '/watch') {
+      const owner = subscriptionFor(chat.id)
       const option = parts[1]
       const workspaces = ctx.get('workspaceRegistry')?.list() ?? []
-      if (option === 'off') { state.subscription.paused = true; releaseInteractions() }
+      if (option === 'off') { owner.paused = true; releaseInteractions(chat.id) }
       else if (option === 'all') {
-        state.subscription.paused = false
-        state.subscription.workspaceIds = workspaces.map((entry) => entry.id)
-      } else if (option === 'on') state.subscription.paused = false
+        owner.paused = false
+        owner.workspaceIds = workspaces.map((entry) => entry.id)
+      } else if (option === 'on') owner.paused = false
       else if (option) {
         const workspace = option === 'here' && inSession
           ? (await assertOrdinarySession(ctx, chatState.sessionId, signal)).workspace
           : workspaces.find((entry) => entry.id === option)
         if (!workspace) throw new Error('Choose a registered workspace id from /watch')
-        state.subscription.paused = false
-        state.subscription.workspaceIds = [...new Set([...(state.subscription.workspaceIds ?? []), workspace.id])]
+        owner.paused = false
+        owner.workspaceIds = [...new Set([...(owner.workspaceIds ?? []), workspace.id])]
       }
       if (option) {
-        releaseInteractions()
-        state.subscription.generation = (state.subscription.generation ?? 0) + 1
+        releaseInteractions(chat.id)
+        owner.generation = (owner.generation ?? 0) + 1
       }
       await persistState()
-      if (option) await sessionWatch.reconcile()
-      const selected = state.subscription.workspaceIds ?? []
-      await sendPlain(chat.id, `Сопровождение: ${state.subscription.paused ? 'выключено' : 'включено'}.\n` +
+      if (option) await sessionWatch.reconcile(chat.id)
+      const selected = owner.workspaceIds ?? []
+      await sendPlain(chat.id, `Сопровождение: ${owner.paused ? 'выключено' : 'включено'}.\n` +
         'Автотемы создаются только для работающих обычных сессий выбранных проектов. Текст новых ответов передаётся Telegram. История не пересылается.\n' +
         workspaces.map((entry) => `${selected.includes(entry.id) ? '✓' : '○'} ${entry.title || basename(entry.path)} — ${entry.id}`).join('\n') +
         '\n/watch <id> · /watch here · /watch all · /watch off · /watch on\nРучные привязки также сопровождаются, пока режим включён.', signal, threadId)
@@ -3784,19 +4025,21 @@ export function apply(ctx, config) {
       if (isAllThread(threadId) || !parts[1]) throw new Error('Use /bind <session-id> in the existing session topic')
       const sessionId = parts[1]
       const { row } = await assertOrdinarySession(ctx, sessionId, signal)
-      const record = state.sessions[sessionId]
+      const owner = subscriptionFor(chat.id)
+      const watch = watchStateFor(chat.id)
+      const record = sessionRecord(sessionId, chat.id)
       if ((chatState.sessionId && chatState.sessionId !== sessionId)
         || (record && (record.chatId !== chat.id || record.threadId !== threadId))) {
         await sendPlain(chat.id, 'Перенос привязок между сессиями и темами запрещён. Открой отдельную тему через /sessions. /bind предназначен только для восстановления свободной темы.', signal, threadId)
         return
       }
-      releaseInteractions()
+      releaseInteractions(chat.id)
       await bindSession(chatState, sessionId, await sessionTitle(sessionId), row.cwd)
       delete state.topicAttempts?.[`${chat.id}:${sessionId}`]
-      delete watchState.bindingErrors[JSON.stringify([chat.id, sessionId])]
-      watchState.bindings[JSON.stringify([chat.id, sessionId])] = state.sessions[sessionId]
-      state.subscription.paused = false
-      state.subscription.generation = (state.subscription.generation ?? 0) + 1
+      delete watch.bindingErrors[JSON.stringify([chat.id, sessionId])]
+      watch.bindings[JSON.stringify([chat.id, sessionId])] = sessionRecord(sessionId, chat.id)
+      owner.paused = false
+      owner.generation = (owner.generation ?? 0) + 1
       await persistState()
       await sendPlain(chat.id, 'Тема привязана к сессии. Старые события автоматически не пересылаются.', signal, threadId)
       return
@@ -3864,55 +4107,9 @@ export function apply(ctx, config) {
     }
 
     if (command === '/fork') {
-      if (!inSession) {
-        await send(chat.id, tr('Open a session first: /sessions.', 'Сначала открой сессию: /sessions.'), signal, threadId)
-        return
-      }
-      if (chatState.busy) {
-        await send(chat.id, tr('Stop the current task before forking.', 'Останови текущую задачу перед форком.'), signal, threadId)
-        return
-      }
-      const controller = ctx.get('sessionController')
-      if (controller === undefined || typeof controller.fork !== 'function') {
-        await send(chat.id, tr('Session forking is unavailable in this profile.', 'Форк сессий недоступен в этом профиле.'), signal, threadId)
-        return
-      }
-      let requested = parts.slice(1).join(' ').trim()
-      if ((requested.startsWith('"') && requested.endsWith('"')) || (requested.startsWith("'") && requested.endsWith("'"))) {
-        requested = requested.slice(1, -1).trim()
-      }
-      if (requested.length > 120) {
-        await send(chat.id, tr('Fork name must be at most 120 characters.', 'Имя форка должно быть не длиннее 120 символов.'), signal, threadId)
-        return
-      }
-      const sourceId = chatState.sessionId
-      let forkId
-      try {
-        const result = await controller.fork({ sessionId: sourceId })
-        forkId = typeof result === 'string' ? result : result?.sessionId
-      } catch (error) {
-        await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
-        return
-      }
-      if (typeof forkId !== 'string' || forkId.length === 0) {
-        await send(chat.id, tr('Fork returned no session id.', 'Форк не вернул id сессии.'), signal, threadId)
-        return
-      }
-      const title = requested.length > 0 ? requested : await nextForkTitle(sourceId)
-      const record = await createForkTopic(forkId, chat.id, title, signal)
-      if (record === undefined) {
-        await send(chat.id, `❌ ${tr('Session was forked but the topic could not be created.', 'Сессия форкнута, но topic создать не удалось.')}`, signal, threadId)
-        return
-      }
-      await send(
-        chat.id,
-        `🍴 ${tr('Session forked', 'Сессия форкнута')}: <b>${escapeHtml(record.title || title)}</b>`,
-        signal,
-        threadId,
-      )
+      await sendPlain(chat.id, 'Форки в Telegram отключены. /sessions открывает исходную сессию: тот же диалог в Web и Telegram.', signal, threadId)
       return
     }
-
     if (command === '/rename') {
       if (!inSession || threadId === undefined) {
         await send(chat.id, tr('Only a session topic can be renamed.', 'Переименовать можно только topic сессии.'), signal, threadId)
@@ -3934,7 +4131,7 @@ export function apply(ctx, config) {
           message_thread_id: threadId,
           name,
         }, signal)
-        const record = state.sessions[chatState.sessionId]
+        const record = sessionRecord(chatState.sessionId, chatState.chatId)
         if (record !== undefined) {
           record.title = name
           record.titleLocked = true
@@ -4085,7 +4282,7 @@ export function apply(ctx, config) {
   async function uncertainUpdate(update, signal) {
     const message = update.message ?? update.callback_query?.message
     const from = update.message?.from ?? update.callback_query?.from
-    if (!message || !userAllowed(from, allowedUsersOf(config)) || !chatAllowed(message.chat, allowedChatsOf(config))) return
+    if (!message || !userAllowed(from, allowedUsersOf(config), state.userPins) || !chatAllowed(message.chat, allowedChatsOf(config))) return
     await sendPlain(message.chat.id, '⚠️ Операция не подтверждена. Она могла уже выполниться; автоматического повтора не будет. Проверь /sessions, /status и очередь в Web перед повторной отправкой.', signal, message.message_thread_id)
   }
   const updateAdmission = createUpdateAdmission({
@@ -4094,7 +4291,7 @@ export function apply(ctx, config) {
       await stateReady
       if (update.callback_query) {
         const query = update.callback_query
-        if (userAllowed(query.from, allowedUsersOf(config)) && chatAllowed(query.message?.chat ?? {}, allowedChatsOf(config))) await claimOwner(query.from, query.message.chat)
+        if (await authenticateIncoming(query.from, query.message?.chat)) await claimOwner(query.from, query.message.chat)
         return handleCallback(query, signal)
       }
       // Editing a Telegram message must not silently issue a second agent turn.
@@ -4198,9 +4395,12 @@ export function apply(ctx, config) {
     }, 5000)
   }
 
-  function releaseInteractions() {
-    for (const id of [...pendingApprovals.keys()]) settleApproval(id, 'unavailable')
+  function releaseInteractions(chatId) {
+    for (const [id, pending] of [...pendingApprovals]) {
+      if (chatId === undefined || pending.chatId === chatId) settleApproval(id, 'unavailable')
+    }
     for (const pending of [...pendingQuestions.values()]) {
+      if (chatId !== undefined && pending.chatId !== chatId) continue
       pendingQuestions.delete(pending.id)
       pending.signal?.removeEventListener('abort', pending.onAbort)
       pending.reject(new Error('Telegram runtime stopped; reopen the question from the session'))

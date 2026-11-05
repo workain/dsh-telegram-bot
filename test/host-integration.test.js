@@ -107,11 +107,17 @@ async function hostScenario(allowedUsers = ['42']) {
   await until(() => pendingPoll, 'initial long poll')
   return {
     calls, prompts, creates, rows, workspace, logs, config, mutations, controller,
-    async request(type, data, sessionId = 'session-web') {
+    async request(type, data, nativeNext = () => 'downstream') {
+      const sessionId = typeof nativeNext === 'string' ? nativeNext : 'session-web'
+      const provider = typeof nativeNext === 'function' ? nativeNext : () => 'downstream'
       const { agent } = await controller.resolveAgent(sessionId)
       const listeners = emitter.listeners(type)
       assert.equal(listeners.length, 1, `${type} has one Host handler`)
-      return listeners[0]({ agent, ...data }, () => 'downstream')
+      const req = { agent, ...data }
+      return listeners[0](req, (...args) => {
+        assert.equal(args.length, 0, 'Cordis next captures the exact request without arguments')
+        return provider(req)
+      })
     },
     async restart() {
       for (const fn of cleanups.splice(0)) await fn?.()
@@ -209,16 +215,37 @@ test('delayed Host interaction admission cannot cross watch off/on generations',
         return waiting.then(() => originalList(...args))
       }
       const offset = sent(host).length
+      const original = new AbortController()
+      let webRequest, answerWeb, nativeCalls = 0, listFinished = false
       const request = tracked(host.request(type, {
         toolName: 'bash', reason: 'Stale admission',
         questions: [{ id: 'old', question: 'Stale question', options: [{ label: 'Yes' }] }],
-        signal: new AbortController().signal,
+        signal: original.signal,
+      }, req => {
+        nativeCalls++
+        webRequest = req
+        assert.equal(listFinished, false, 'Web dispatch does not wait for Telegram admission')
+        return new Promise(resolve => { answerWeb = resolve })
       }))
       await until(() => entered, 'questionChat ordinary-session check blocked in native list')
+      assert.equal(nativeCalls, 1, 'native Web provider is already visible while list is held')
+      const webSignal = webRequest.signal
+      assert.notEqual(webSignal, original.signal, 'capture the actual native provider signal alias')
       await host.feed(update(id++, '/watch off'), update(id++, '/watch on'))
       release()
-      await until(() => request.settled, 'stale request falls through after list resumes')
-      assert.equal(request.value, 'downstream', 'old admission cannot own the new subscription generation')
+      // Await the held list continuation and its admission check, not a timeout.
+      await waiting
+      await new Promise(setImmediate)
+      listFinished = true
+      assert.equal(request.settled, false, 'invalidating Telegram does not discard the pending Web answer')
+      assert.equal(webSignal.aborted, false, 'native Web request remains answerable after off/on')
+      const expected = type === 'approval/request' ? 'allowed-once' : { answers: [{ id: 'old', selected: ['Yes'] }] }
+      answerWeb(expected)
+      await request.promise
+      assert.equal(request.error, undefined)
+      assert.deepEqual(request.value, expected, 'legitimate native answer settles the original Host request')
+      assert.equal(nativeCalls, 1)
+      assert.equal(original.signal.aborted, false)
       assert.ok(sent(host).slice(offset).every(call => !buttons(call).some(button => /^(?:a:|q:)/.test(button.callback_data))), 'no old Allow/Question keyboard reaches the new generation')
     }
   } finally { await host.cleanup() }
@@ -419,12 +446,18 @@ test('Host Web events route to watched topic; native queued prompts deduplicate;
     assert.equal(host.prompts.length, 2, 'duplicate Telegram updates never reach native admission twice')
 
     host.emit('session-web', 12, 'assistant/message', { turn: 3, message: { role: 'assistant', content: [{ type: 'text', text: `Web answer ${botFixture}` }] } })
+    await until(() => sent(host).some(call => call.body.text.includes('Web answer')), 'committed assistant answer mirrored before turn/end')
+    const answer = sent(host).find(call => call.body.text.includes('Web answer'))
+    assert.match(answer.body.text, /^🤖 /)
+    assert.equal(answer.body.message_thread_id, 7001)
     host.emit('session-web', 13, 'turn/end', { turn: 3, reason: { kind: 'completed' } })
     await host.cursor('session-web', 13)
-    const answer = sent(host).find(call => call.body.text.includes('Web answer'))
-    assert.ok(answer, 'committed assistant answer delivered at native turn/end')
-    assert.equal(answer.body.message_thread_id, 7001)
-    assert.match(answer.body.text, /Turn 3: completed/)
+    await until(() => sent(host).some(call => /Turn 3: completed/.test(call.body.text)), 'separate native turn completion status')
+    const completion = sent(host).find(call => /Turn 3: completed/.test(call.body.text))
+    assert.notEqual(completion, answer, 'turn status is separate from the committed answer')
+    assert.equal(completion.body.message_thread_id, 7001)
+    assert.doesNotMatch(completion.body.text, /Web answer/, 'turn/end does not duplicate the mirrored answer')
+    assert.equal(sent(host).filter(call => call.body.text.includes('Web answer')).length, 1)
     assert.match(answer.body.text, /\[REDACTED\]/)
     assert.ok(sent(host).every(call => !call.body.text.includes(botFixture)), 'bot token is never outbound text')
     const count = sent(host).length

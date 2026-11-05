@@ -16,6 +16,12 @@
     "session-api.js",
     "session-watch.js",
     "state-validation.js",
+    "session-selection.js",
+    "user-access.js",
+    "topic-recovery.js",
+    "session-history.js",
+    "mirrored-interaction.js",
+    "session-link.js",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
@@ -35,7 +41,8 @@
       "inject": [
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-plugin-manager"
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-client-ui-workspace"
       ]
     }
   },
