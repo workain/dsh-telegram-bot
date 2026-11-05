@@ -5,4 +5,4 @@
 # it through the profile patch without restarting the plugin.
 - insert:
     - id: telegram-bot
-      name: 'dsh-telegram-bot'
+      name: '@workain/dsh-telegram-bot'

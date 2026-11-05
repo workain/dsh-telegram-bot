@@ -13,6 +13,9 @@ import https from 'node:https'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import telegramifyMarkdown from 'telegramify-markdown'
+import { createSessionWatch, redactTelegramText } from './session-watch.js'
+import { validatePluginState } from './state-validation.js'
+import { admitPrompt, assertOrdinarySession, createWorkspaceSession, createUpdateAdmission, resolveSessionAgent, stopSession } from './session-api.js'
 
 /** Loader row id and settings namespace; the npm package name stays dsh-telegram-bot. */
 export const name = 'telegram-bot'
@@ -359,6 +362,9 @@ const BOT_COMMANDS = [
   { command: 'stop', description: 'Stop the current task' },
   { command: 'status', description: 'Bot and session status' },
   { command: 'sessions', description: 'Browse workspaces and sessions' },
+  { command: 'watch', description: 'Choose projects for automatic Web session topics' },
+  { command: 'new', description: 'Create a session in a chosen workspace' },
+  { command: 'bind', description: 'Recover an existing topic binding' },
   { command: 'current', description: 'Show the topic session' },
   { command: 'menu', description: 'Show the model and session controls' },
   { command: 'rename', description: 'Rename this Telegram topic' },
@@ -376,6 +382,9 @@ const BOT_COMMANDS_RU = [
   { command: 'stop', description: 'Остановить текущую задачу' },
   { command: 'status', description: 'Статус бота и сессии' },
   { command: 'sessions', description: 'Выбрать workspace и сессию' },
+  { command: 'watch', description: 'Выбрать проекты для автотем Web-сессий' },
+  { command: 'new', description: 'Создать сессию в выбранном проекте' },
+  { command: 'bind', description: 'Восстановить привязку существующей темы' },
   { command: 'current', description: 'Показать сессию этого топика' },
   { command: 'menu', description: 'Показать меню модели и сессии' },
   { command: 'rename', description: 'Переименовать Telegram-топик' },
@@ -389,7 +398,7 @@ const BOT_COMMANDS_RU = [
 /** Bound one Telegram message body to stay under the 4096-character API limit. */
 const MAX_TELEGRAM_TEXT = 3800
 /** Host-local diagnostics directory; no secrets are written here. */
-const STATUS_DIR = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'telegram')
+const STATUS_DIR = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'telegram-workain')
 
 export const Config = z.object({
   /**
@@ -515,9 +524,8 @@ function allowedChatsOf(config) {
  */
 function userAllowed(from, allowedUsers) {
   if (from === undefined || !Array.isArray(allowedUsers)) return false
-  const id = String(from.id)
-  const username = typeof from.username === 'string' ? `@${from.username.toLowerCase()}` : undefined
-  return allowedUsers.some((entry) => entry === id || (username !== undefined && normalizeEntry(entry) === username))
+  const ids = allowedUsers.map(String).filter((entry) => /^\d+$/.test(entry))
+  return ids.length === 1 && ids[0] === String(from.id)
 }
 
 /**
@@ -528,7 +536,8 @@ function userAllowed(from, allowedUsers) {
  * @returns whether the bot may answer in this chat.
  */
 function chatAllowed(chat, allowedChats) {
-  if (!Array.isArray(allowedChats) || allowedChats.length === 0) return chat.type === 'private'
+  if (chat.type !== 'private') return false
+  if (!Array.isArray(allowedChats) || allowedChats.length === 0) return true
   const id = String(chat.id)
   const username = typeof chat.username === 'string' ? `@${chat.username.toLowerCase()}` : undefined
   return allowedChats.some((entry) => entry === id || (username !== undefined && normalizeEntry(entry) === username))
@@ -544,17 +553,27 @@ const STATE_PATH = join(STATUS_DIR, 'state.json')
 async function loadState() {
   try {
     const parsed = JSON.parse(await readFile(STATE_PATH, 'utf8'))
-    if (parsed !== null && typeof parsed === 'object') {
+    validatePluginState(parsed)
+    const record = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
+    if (record(parsed) && [2, 3].includes(parsed.version) && record(parsed.sessions) && record(parsed.threads)
+      && (parsed.watch === undefined || record(parsed.watch))
+      && (parsed.updateOffset === undefined || (Number.isSafeInteger(parsed.updateOffset) && parsed.updateOffset >= 0))) {
       return {
-        version: 2,
+        version: 3,
+        subscription: parsed.subscription ?? {},
+        watch: parsed.watch ?? {},
+        updateOffset: parsed.updateOffset ?? 0,
+        updateLedger: parsed.updateLedger ?? {},
+        topicAttempts: parsed.topicAttempts ?? {},
         sessions: parsed.sessions !== null && typeof parsed.sessions === 'object' ? parsed.sessions : {},
         threads: parsed.threads !== null && typeof parsed.threads === 'object' ? parsed.threads : {},
       }
     }
-  } catch {
-    // Missing or corrupt state is nonfatal; the next session creates a mapping.
+    throw new Error('Invalid Telegram state')
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw new Error('Telegram state unreadable; restore it before enabling the bot')
   }
-  return { version: 2, sessions: {}, threads: {} }
+  return { version: 3, sessions: {}, threads: {} }
 }
 
 /** Durable control-chat id for lifecycle notifications. */
@@ -583,7 +602,7 @@ let runtimeStatus = {
   username: '',
   updatedAt: new Date().toISOString(),
   transport: 'https-ipv4',
-  version: '0.3.0',
+  version: '0.3.0-dev.1',
   agentBridge: 'v1',
   codeRevision: 'bucket-50',
   lastPollAt: 0,
@@ -647,11 +666,14 @@ export function apply(ctx, config) {
   /** Invalidates a start that was overtaken by stop/restart. */
   let startEpoch = 0
   /** Durable chat → session mapping. */
-  let state = { version: 2, sessions: {}, threads: {} }
+  const watchState = { bindings: {}, bindingErrors: {}, sessions: {} }
+  let state = { version: 3, sessions: {}, threads: {}, watch: watchState }
   /** Serializes state-file writes. */
   let stateWrite = Promise.resolve()
   /** Per-chat live bridge state. */
   const chats = new Map()
+  // Incoming updates are admitted serially; never use a random prompt id.
+  let incomingMessageId
   /** Per-chat token buckets for outbound Bot API traffic. */
   const outboundStates = new Map()
   /** Agent API calls use this lifetime; the bot polling lifetime is separate. */
@@ -660,23 +682,103 @@ export function apply(ctx, config) {
   let topics = { chatId: 0 }
   /** Resolves after the mapping and topic files have been read. */
   const stateReady = Promise.all([
-    loadState().then((loaded) => { state = loaded }),
+    loadState().then((loaded) => { Object.assign(watchState, loaded.watch ?? {}); state = { ...loaded, watch: watchState } }),
     loadTopics().then((loaded) => { topics = loaded }),
-  ]).catch((error) => warn(`state load failed: ${messageOf(error)}`))
+  ])
 
   /**
    * Persist the chat → session mapping atomically.
    * @returns the queued write.
    */
   function persistState() {
-    stateWrite = stateWrite.then(async () => {
+    stateWrite = stateWrite.catch(() => {}).then(async () => {
       await mkdir(STATUS_DIR, { recursive: true })
       const temporary = `${STATE_PATH}.${process.pid}.tmp`
       await writeFile(temporary, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
       await rename(temporary, STATE_PATH)
-    }).catch((error) => warn(`state write failed: ${messageOf(error)}`))
+    }).catch((error) => { warn('state write failed; admission paused'); throw error })
     return stateWrite
   }
+
+  function watchPolicy() {
+    const owner = state.subscription ?? {}
+    return {
+      enabled: isEnabled(config) && me !== undefined && !owner.paused,
+      allowed: userAllowed({ id: owner.userId }, allowedUsersOf(config))
+        && chatAllowed({ id: owner.chatId, type: 'private' }, allowedChatsOf(config)),
+      chatId: owner.chatId,
+      workspaceIds: owner.workspaceIds ?? [],
+      generation: (owner.generation ?? 0) + startEpoch,
+      boundSessionIds: Object.values(state.sessions).filter((record) => record.chatId === owner.chatId).map((record) => record.sessionId),
+    }
+  }
+
+  async function claimOwner(from, chat) {
+    await stateReady
+    if (state.subscription?.userId !== from.id || state.subscription?.chatId !== chat.id) {
+      releaseInteractions()
+      state.subscription = { userId: from.id, chatId: chat.id, workspaceIds: [], paused: false, generation: (state.subscription?.generation ?? 0) + 1 }
+      state.sessions = {}
+      state.threads = {}
+      Object.assign(watchState, { bindings: {}, bindingErrors: {}, sessions: {} })
+      state.watch = watchState
+      chats.clear()
+      await persistState()
+    }
+  }
+
+  const sessionWatch = createSessionWatch({
+    ctx, getPolicy: watchPolicy,
+    getState: () => watchState, persist: persistState,
+    ensureTopic: async (sessionId, chatId) => {
+      const record = await ensureBoundTopic(sessionId, chatId, bridgeAbort.signal)
+      return record
+    },
+    send: async (chat, text) => {
+      const generation = watchPolicy().generation
+      for (const chunk of splitTelegramText(text)) {
+        if (!watchPolicy().enabled || !watchPolicy().allowed || watchPolicy().generation !== generation) return
+        await call('sendMessage', { chat_id: chat.chatId, message_thread_id: chat.threadId, text: chunk }, bridgeAbort.signal, 30_000, generation)
+      }
+    },
+    onError: () => warn('Session delivery paused or failed; check Telegram status and /watch.'),
+  })
+
+  ctx.on('session/event', (session, event) => {
+    if (event.type !== 'session/title' || !watchPolicy().enabled || !watchPolicy().allowed) return
+    const record = state.sessions[session.id]
+    if (!record || record.chatId !== watchPolicy().chatId) return
+    fireAndForget('topic-title', async () => {
+      const chat = await chatFor(record.chatId, record.threadId)
+      await applyTopicTitle(chat, event.data?.title)
+    })
+  })
+
+  // Own foreground questions only for explicitly bound, authorized sessions.
+  // Never await topic creation in an approval boundary or resurrect cold agents.
+  async function questionChat(agent) {
+    if (!agent || !watchPolicy().enabled || !watchPolicy().allowed) return undefined
+    const generation = watchPolicy().generation
+    const id = agent.session?.id
+    const record = state.sessions[id]
+    if (!record || record.sessionId !== id || record.chatId !== state.subscription?.chatId
+      || !Number.isSafeInteger(record.threadId) || state.threads[`${record.chatId}:${record.threadId}`] !== id) return undefined
+    try { await assertOrdinarySession(ctx, id, bridgeAbort.signal) } catch { return undefined }
+    const chat = await chatFor(record.chatId, record.threadId)
+    if (!watchPolicy().enabled || !watchPolicy().allowed || watchPolicy().generation !== generation) return undefined
+    chat.boundAgent = agent
+    return chat
+  }
+  ctx.on('approval/request', async (req, next) => {
+    const chat = await questionChat(req.agent)
+    if (!chat) return next()
+    return requestApproval(req.agent, chat, req, next)
+  }, { prepend: true })
+  ctx.on('user-questions/request', async (req, next) => {
+    const chat = await questionChat(req.agent)
+    if (!chat) return next()
+    return requestUserQuestions(req.agent, chat, req, next)
+  }, { prepend: true })
 
   /**
    * Resolve one chat's transient bridge state.
@@ -731,6 +833,11 @@ export function apply(ctx, config) {
    * @param title - display title.
    */
   async function bindSession(chat, sessionId, title, cwd) {
+    const prior = state.sessions[sessionId]
+    if ((prior && (prior.chatId !== chat.chatId || prior.threadId !== chat.threadId))
+      || (state.threads[chat.key] && state.threads[chat.key] !== sessionId)) {
+      throw new Error('Topic reassignment is not supported. Open a separate session topic with /sessions.')
+    }
     chat.sessionId = sessionId
     if (typeof cwd === 'string' && cwd.length > 0) chat.cwd = cwd
     state.threads[chat.key] = sessionId
@@ -1260,12 +1367,15 @@ export function apply(ctx, config) {
    * @param signal - runtime lifetime.
    * @returns the method result.
    */
-  async function call(method, payload, signal, timeoutMs = 30_000) {
+  async function call(method, payload, signal, timeoutMs = 30_000, expectedGeneration) {
     const token = await resolveToken()
     if (token === undefined) throw new Error('TELEGRAM_BOT_TOKEN is not configured')
     if (process.env.NODE_ENV !== 'test' && payload !== null && typeof payload === 'object' && payload.chat_id !== undefined && method !== 'getUpdates') {
       await paceOutbound(payload.chat_id, signal)
     }
+    // Apply the same best-effort filter to manual history/questions/titles too.
+    payload = JSON.parse(JSON.stringify(payload, (key, value) =>
+      typeof value === 'string' && ['text', 'name', 'caption'].includes(key) ? redactTelegramText(value) : value))
     const body = JSON.stringify(payload)
     // Mirror Hermes' Telegram fallback: try the normal IPv4 path first, then
     // the Bot API seed IPv4 literals with Host/SNI kept on api.telegram.org.
@@ -1277,10 +1387,17 @@ export function apply(ctx, config) {
     for (let attempt = 0; attempt < targets.length + 4; attempt += 1) {
       const target = targets[attempt % targets.length]
       try {
+        if (payload?.chat_id !== undefined && state.subscription?.userId !== undefined) {
+          const policy = watchPolicy()
+          if (!policy.allowed || policy.chatId !== payload.chat_id || !isEnabled(config)
+            || (expectedGeneration !== undefined && (!policy.enabled || policy.generation !== expectedGeneration))) throw new Error('Telegram owner access revoked')
+        }
         return await requestOnce(target, token, method, body, signal, timeoutMs)
       } catch (error) {
         lastError = error
         if (signal.aborted) throw error
+        // Retrying an unknown write outcome can duplicate messages/topics.
+        if (error?.telegram !== true && method !== 'getUpdates' && method !== 'getMe' && method !== 'getWebhookInfo') throw error
         if (error?.telegram === true) {
           if (payload !== null && typeof payload === 'object' && payload.chat_id !== undefined) {
             noteRateLimit(payload.chat_id, error.retryAfter)
@@ -1503,8 +1620,6 @@ export function apply(ctx, config) {
    * @returns prompt content block and display name.
    */
   async function saveTelegramAttachment(message, signal) {
-    const attachments = ctx.get('attachments')
-    if (attachments === undefined) throw new Error('DSH attachment store is unavailable')
     const photo = Array.isArray(message.photo) ? message.photo.at(-1) : undefined
     const document = message.document
     const fileId = photo?.file_id ?? document?.file_id
@@ -1515,11 +1630,10 @@ export function apply(ctx, config) {
     const mediaType = photo !== undefined ? 'image/jpeg' : String(document?.mime_type ?? '')
     const bytes = await downloadTelegramFile(fileId, signal)
     if (mediaType === 'image/jpeg' || mediaType === 'image/png' || mediaType === 'image/webp' || mediaType === 'image/gif') {
-      const attachment = await attachments.saveImage({ data: bytes, mediaType, name })
-      return { block: { type: 'image', attachment }, name }
+      return { block: { type: 'image', mediaType, data: bytes.toString('base64'), name }, name }
     }
-    const attachment = await attachments.saveFile({ data: bytes, name })
-    return { block: { type: 'file', attachment }, name }
+    // Files need an opaque receipt bound to the receiving Agent, not a raw ref.
+    return { block: { type: 'telegram-file', data: bytes.toString('base64'), name }, name }
   }
 
   /**
@@ -1590,7 +1704,7 @@ export function apply(ctx, config) {
    * @param signal - request lifetime.
    * @returns the Bot API result, or undefined.
    */
-  async function sendKeyboardMarkdown(chatId, threadId, text, keyboard, signal) {
+  async function sendKeyboardMarkdown(chatId, threadId, text, keyboard, signal, expectedGeneration) {
     const body = toTelegramMarkdown(text)
     try {
       return await call('sendMessage', {
@@ -1599,7 +1713,7 @@ export function apply(ctx, config) {
         text: body,
         parse_mode: 'MarkdownV2',
         reply_markup: { inline_keyboard: keyboard },
-      }, signal)
+      }, signal, 30_000, expectedGeneration)
     } catch (error) {
       const detail = messageOf(error)
       if (!isTelegramParseError(detail)) throw error
@@ -1612,7 +1726,7 @@ export function apply(ctx, config) {
         ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
         text,
         reply_markup: { inline_keyboard: keyboard },
-      }, signal).catch(() => undefined)
+      }, signal, 30_000, expectedGeneration).catch(() => undefined)
     }
   }
 
@@ -1711,6 +1825,23 @@ export function apply(ctx, config) {
   const pendingApprovals = new Map()
   /** Pending structured user questions keyed by short callback id. */
   const pendingQuestions = new Map()
+  function interactionIdentity(chat) {
+    return { chatId: chat.chatId, threadId: chat.threadId, sessionId: chat.sessionId, bindingGeneration: watchPolicy().generation }
+  }
+  function validInteraction(pending) {
+    const policy = watchPolicy()
+    const record = state.sessions[pending.sessionId]
+    return policy.enabled && policy.allowed && policy.chatId === pending.chatId
+      && policy.generation === pending.bindingGeneration
+      && state.threads[`${pending.chatId}:${pending.threadId}`] === pending.sessionId
+      && record?.chatId === pending.chatId && record?.threadId === pending.threadId
+  }
+  function invalidateQuestion(pending) {
+    if (!pendingQuestions.delete(pending.id)) return
+    pending.signal?.removeEventListener('abort', pending.onAbort)
+    pending.reject(new Error('Telegram question binding changed or access was revoked'))
+  }
+
   /** In-flight topic opens keyed by chat and DSH session. */
   const openingTopics = new Map()
 
@@ -1723,6 +1854,7 @@ export function apply(ctx, config) {
   function settleApproval(id, outcome) {
     const pending = pendingApprovals.get(id)
     if (pending === undefined) return false
+    if (outcome === 'allowed-once' && !validInteraction(pending)) outcome = 'cancelled'
     pendingApprovals.delete(id)
     pending.signal?.removeEventListener('abort', pending.onAbort)
     pending.resolve(outcome)
@@ -1751,7 +1883,9 @@ export function apply(ctx, config) {
    * @returns approval outcome.
    */
   async function requestApproval(agent, chat, req, next) {
-    if (chat.boundAgent !== agent) return next()
+    if (chat.boundAgent !== agent || chat.sessionId !== agent.session.id) return next()
+    const identity = interactionIdentity(chat)
+    if (!validInteraction(identity)) return next()
     if (req.signal?.aborted) return 'cancelled'
     const id = randomUUID().replaceAll('-', '').slice(0, 10)
     const reason = req.displayReason?.ru
@@ -1772,14 +1906,16 @@ export function apply(ctx, config) {
         { text: tr('✅ Allow', '✅ Разрешить'), callback_data: `a:y:${id}` },
       ]],
       bridgeAbort.signal,
+      identity.bindingGeneration,
     )
-    if (result?.message_id === undefined) return 'unavailable'
+    if (result?.message_id === undefined || !validInteraction(identity)) return 'unavailable'
     const messageId = result.message_id
     return new Promise((resolve) => {
       const onAbort = () => {
         settleApproval(id, 'cancelled')
       }
       const pending = {
+        ...identity,
         resolve,
         chatId: chat.chatId,
         threadId: chat.threadId,
@@ -1855,6 +1991,7 @@ export function apply(ctx, config) {
    * @returns true when Telegram accepted the prompt.
    */
   async function sendQuestionPrompt(pending) {
+    if (!validInteraction(pending)) return false
     const question = pending.questions[pending.index]
     pending.awaitingCustom = (question.options ?? []).length === 0
     const keyboard = pending.awaitingCustom ? [] : questionKeyboard(pending)
@@ -1864,8 +2001,9 @@ export function apply(ctx, config) {
       questionText(pending),
       keyboard,
       pending.signal,
+      pending.bindingGeneration,
     )
-    if (result?.message_id === undefined) return false
+    if (result?.message_id === undefined || !validInteraction(pending)) return false
     pending.messageId = result.message_id
     return true
   }
@@ -1875,6 +2013,7 @@ export function apply(ctx, config) {
    * @param pending - completed batch.
    */
   function finishQuestions(pending) {
+    if (!validInteraction(pending)) { invalidateQuestion(pending); return }
     if (!pendingQuestions.delete(pending.id)) return
     pending.signal?.removeEventListener('abort', pending.onAbort)
     pending.resolve({ answers: pending.answers })
@@ -1896,6 +2035,7 @@ export function apply(ctx, config) {
    * @param signal - request lifetime.
    */
   async function completeQuestion(pending, selected, custom, signal) {
+    if (!validInteraction(pending)) { invalidateQuestion(pending); return }
     if (pending.busy) return
     pending.busy = true
     try {
@@ -1939,7 +2079,9 @@ export function apply(ctx, config) {
    * @returns the structured answer.
    */
   async function requestUserQuestions(agent, chat, req, next) {
-    if (chat.boundAgent !== agent || typeof chat.sessionId !== 'string') return next()
+    if (chat.boundAgent !== agent || chat.sessionId !== agent.session.id) return next()
+    const identity = interactionIdentity(chat)
+    if (!validInteraction(identity)) return next()
     if (pendingQuestionFor(chat.chatId, chat.threadId) !== undefined) return next()
     const signal = req.signal ?? bridgeAbort.signal
     if (signal.aborted) return next()
@@ -1950,7 +2092,10 @@ export function apply(ctx, config) {
       resolvePromise = resolve
       rejectPromise = reject
     })
+    // Abort can happen while the Telegram send is still in flight.
+    void promise.catch(() => {})
     const pending = {
+      ...identity,
       id,
       chatId: chat.chatId,
       threadId: chat.threadId,
@@ -2048,7 +2193,7 @@ export function apply(ctx, config) {
    */
   async function consumeQuestionReply(chat, text, signal) {
     const command = normalizeCommand(text.trim().split(/\s+/u)[0])
-    if (BOT_COMMANDS.some((entry) => `/${entry.command}` === command)) return false
+    if (command.startsWith('/')) return false
     const pending = pendingQuestionFor(chat.chatId, chat.threadId)
     if (pending === undefined || !pending.awaitingCustom) return false
     const question = pending.questions[pending.index]
@@ -2220,86 +2365,15 @@ export function apply(ctx, config) {
    * @returns the live agent.
    */
   async function ensureAgent(chat) {
-    const agents = ctx.get('agents')
-    if (agents === undefined) throw new Error('dsh-agent is not mounted in this profile')
-    const controllerService = ctx.get('sessionController')
-    const controller = controllerService !== null && typeof controllerService?.createSession === 'function' ? controllerService : undefined
-    await hydrateSelection(chat)
-    const selection = selectionForChat(chat)
-    const chosen = selection.current
-    const agentOptions = {
-      agentOptions: {
-        provider: chosen.provider,
-        model: chosen.model,
-        ...(chosen.reasoningEffort === undefined ? {} : { reasoningEffort: chosen.reasoningEffort }),
-      },
+    if (!chat.sessionId) {
+      const cwd = chat.cwd ?? defaultWorkspaceCwd()
+      const sessionId = await createWorkspaceSession(ctx, cwd, presetOf(), bridgeAbort.signal)
+      await bindSession(chat, sessionId, '', cwd)
     }
-    const setup = (agentCtx, agent) => setupAgent(agentCtx, agent, chat)
-    const targetCwd = chat.cwd
-      ?? (typeof chat.sessionId === 'string' ? state.sessions[chat.sessionId]?.cwd : undefined)
-      ?? cwdOf()
-
-    if (typeof chat.sessionId === 'string' && chat.sessionId.length > 0) {
-      const live = agents.get(chat.sessionId)
-      if (live !== undefined) {
-        if (typeof live.session?.header?.cwd === 'string') chat.cwd = live.session.header.cwd
-        attachAgent(live, chat)
-        await applyPermission(chat, live)
-        return live
-      }
-      try {
-        // The Web session controller composes the same scoped services the GUI
-        // uses (model selection, preset, provider connection). Prefer it when
-        // present; the raw registry path is the headless fallback.
-        const resumed = controller === undefined
-          ? await agents.resume({ resumeSessionId: chat.sessionId, ...agentOptions, setup })
-          : await controller.resume(chat.sessionId)
-        const agent = resumed?.agent ?? resumed
-        if (typeof agent?.session?.header?.cwd === 'string') chat.cwd = agent.session.header.cwd
-        attachAgent(agent, chat)
-        await applyPermission(chat, agent)
-        info(`resumed Telegram session ${chat.sessionId}`)
-        return agent
-      } catch (error) {
-        warn(`resume failed for ${chat.sessionId}: ${messageOf(error)}`)
-        const failed = chat.sessionId
-        chat.sessionId = undefined
-        delete state.threads[chat.key]
-        if (typeof failed === 'string') delete state.sessions[failed]
-        await persistState()
-      }
-    }
-
-    const preset = presetOf()
-    if (controller !== undefined) {
-      try {
-        const created = await controller.createSession({
-          cwd: targetCwd,
-          ...(preset === undefined ? {} : { agentPreset: preset }),
-        })
-        const agent = created?.agent ?? created
-        const sessionId = agent.session?.id ?? agent.id
-        await bindSession(chat, sessionId, '', targetCwd)
-        await attachToWorkspace(sessionId, targetCwd)
-        attachAgent(agent, chat)
-        await applyPermission(chat, agent)
-        info(`created Telegram session ${sessionId} via sessionController`)
-        return agent
-      } catch (error) {
-        warn(`sessionController create failed, using raw agent: ${messageOf(error)}`)
-      }
-    }
-
-    const sessionId = `session-${randomUUID()}`
-    const meta = { cwd: targetCwd }
-    if (preset !== undefined && ctx.get('agentPresets') !== undefined) meta.agentPreset = preset
-    const handle = await agents.create({ sessionId, meta, ...agentOptions, setup })
-    await bindSession(chat, sessionId, '', targetCwd)
-    await attachToWorkspace(sessionId, meta.cwd)
-    attachAgent(handle.agent, chat)
-    await applyPermission(chat, handle.agent)
-    info(`created Telegram session ${sessionId}`)
-    return handle.agent
+    // Errors must never fork silently or reset another interface's model/policy.
+    const agent = await resolveSessionAgent(ctx, chat.sessionId, bridgeAbort.signal)
+    chat.boundAgent = agent
+    return agent
   }
 
   /** Stop a pending stream edit timer. */
@@ -2651,38 +2725,12 @@ export function apply(ctx, config) {
    * @param signal - runtime lifetime.
    */
   async function runAgent(chat, text, signal, attachments = []) {
-    if (chat.busy) {
-      await send(chat.chatId, tr('⏳ Already working on a task. Send /stop to abort.', '⏳ Уже выполняю задачу. Отправь /stop, чтобы прервать.'), signal, chat.threadId)
-      return
-    }
-    chat.busy = true
-    chat.done = false
-    chat.turnSource = 'telegram'
-    chat.awaitingTurn = true
-    chat.activeTurn = undefined
-    chat.text = ''
-    chat.lastText = ''
-    chat.messageId = null
-    clearEditTimer(chat)
-    resetAux(chat)
-    chat.answerEdit = Promise.resolve()
-    const answer = await sendPlain(chat.chatId, tr('⏳ Generating…', '⏳ Генерирую…'), bridgeAbort.signal, chat.threadId)
-    chat.messageId = answer?.message_id ?? null
-    if (readLive(config.showThinking, true) === true) {
-      const thinking = await sendPlain(chat.chatId, '💭 Thinking…', bridgeAbort.signal, chat.threadId)
-      chat.thinkingMessageId = thinking?.message_id ?? null
-    }
-    try {
-      const agent = await ensureAgent(chat)
-      agent.followup({ id: randomUUID(), role: 'user', content: [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments], source: { kind: 'user' } })
-      // The turn/end listener finalizes the Telegram turn. Keep whenIdle only
-      // as a fallback for compositions that do not emit turn events.
-      void agent.whenIdle().then(() => {
-        if (chat.turnSource === 'telegram' && chat.awaitingTurn) return finalizeChat(chat)
-      }).catch((error) => fireAndForget('agent-idle', () => failChat(chat, error, true)))
-    } catch (error) {
-      fireAndForget('agent-start', () => failChat(chat, error))
-    }
+    await ensureAgent(chat)
+    await admitPrompt(ctx, {
+      sessionId: chat.sessionId, chatId: chat.chatId, messageId: incomingMessageId,
+      text, attachments,
+    }, signal)
+    await sendPlain(chat.chatId, tr('📥 Accepted into the session queue.', '📥 Принято в очередь сессии.'), signal, chat.threadId)
   }
 
 
@@ -2710,7 +2758,7 @@ export function apply(ctx, config) {
    * @param signal - request lifetime.
    * @returns the Bot API result, or undefined.
    */
-  async function sendKeyboard(chatId, threadId, text, keyboard, signal) {
+  async function sendKeyboard(chatId, threadId, text, keyboard, signal, expectedGeneration) {
     try {
       return await call('sendMessage', {
         chat_id: chatId,
@@ -2718,7 +2766,7 @@ export function apply(ctx, config) {
         text,
         parse_mode: 'HTML',
         reply_markup: { inline_keyboard: keyboard },
-      }, signal)
+      }, signal, 30_000, expectedGeneration)
     } catch (error) {
       if (!signal.aborted) warn(`sendKeyboard failed: ${messageOf(error)}`)
       return undefined
@@ -2818,16 +2866,7 @@ export function apply(ctx, config) {
     const contextLabel = context.used === undefined
       ? formatTokens(context.windowSize)
       : `${formatTokens(context.used)}/${formatTokens(context.windowSize)}`
-    return [
-      [
-        { text: `🤖 ${modelLabel(current.model)}`, callback_data: 'o:model' },
-        { text: `🧠 ${tr('Effort', 'Усилие')}: ${effortLabel(current.reasoningEffort)}`, callback_data: 'o:effort' },
-      ],
-      [
-        { text: `🛡 ${permissionLabel(permission)}`, callback_data: 'o:mode' },
-        { text: `📚 ${tr('Context', 'Контекст')}: ${contextLabel}`, callback_data: 'o:context' },
-      ],
-    ]
+    return [[{ text: `📚 ${tr('Context', 'Контекст')}: ${contextLabel}`, callback_data: 'o:context' }]]
   }
 
   /**
@@ -3120,45 +3159,38 @@ export function apply(ctx, config) {
    * @returns topic record, or undefined.
    */
   async function openTopicForSession(sessionId, chatId, signal) {
+    const record = await ensureBoundTopic(sessionId, chatId, signal)
+    await sendPlain(chatId, tr('Session connected. New progress and results will appear here; /last explicitly requests history.', 'Сессия подключена. Здесь будут новые события и результаты; /last явно запрашивает историю.'), signal, record.threadId)
+    await sessionWatch.reconcile()
+    return record
+  }
+
+  async function ensureBoundTopic(sessionId, chatId, signal) {
     const key = `${chatId}:${sessionId}`
-    const inFlight = openingTopics.get(key)
-    if (inFlight !== undefined) return inFlight
+    if (openingTopics.has(key)) return openingTopics.get(key)
     const opening = (async () => {
+      const { row } = await assertOrdinarySession(ctx, sessionId, signal)
       const existing = state.sessions[sessionId]
-      if (existing !== undefined && existing.chatId === chatId && typeof existing.threadId === 'number') {
-        // Re-open the stored topic and make it visible in Telegram. If the
-        // thread was deleted, drop the stale mapping and create a fresh one.
-        if (await deliverSessionTopic(existing, chatId, signal)) return existing
-        delete state.sessions[sessionId]
-        delete state.threads[`${chatId}:${existing.threadId}`]
-        await persistState()
-      }
+      if (existing?.chatId === chatId && Number.isSafeInteger(existing.threadId)) return existing
+      if (!watchPolicy().enabled || !watchPolicy().allowed || watchPolicy().chatId !== chatId) throw new Error('Telegram subscription unavailable')
+      state.topicAttempts ??= {}
+      if (state.topicAttempts[key]) throw new Error('Topic creation outcome unknown. Inspect Telegram and use /bind in the existing topic.')
       const title = await sessionTitle(sessionId)
-      const records = await ctx.get('sessionQuery')?.listSessions(signal)
-      const header = records?.find((entry) => entry.header.id === sessionId)?.header
+      state.topicAttempts[key] = 'pending'
+      await persistState()
+      // Never auto-retry a potentially accepted createForumTopic after timeout.
       const threadId = await createTopic(chatId, title, signal)
-      if (threadId === undefined) return undefined
-      const record = {
-        sessionId,
-        chatId,
-        threadId,
-        title,
-        ...(header?.cwd === undefined ? {} : { cwd: header.cwd }),
-        updatedAt: Date.now(),
-      }
+      if (!Number.isSafeInteger(threadId)) throw new Error('Telegram returned no topic identity')
+      if (state.subscription?.chatId !== chatId) throw new Error('Topic created for a previous owner; reconcile before retrying')
+      const record = { sessionId, chatId, threadId, title, cwd: row.cwd, updatedAt: Date.now() }
       state.sessions[sessionId] = record
       state.threads[`${chatId}:${threadId}`] = sessionId
+      delete state.topicAttempts[key]
       await persistState()
-      await notifyAll(`📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal)
-      await deliverSessionTopic(record, chatId, signal)
       return record
     })()
     openingTopics.set(key, opening)
-    try {
-      return await opening
-    } finally {
-      if (openingTopics.get(key) === opening) openingTopics.delete(key)
-    }
+    try { return await opening } finally { openingTopics.delete(key) }
   }
 
   /**
@@ -3357,7 +3389,7 @@ export function apply(ctx, config) {
     if (chat === undefined || from === undefined) return
     const data = String(query.data ?? '')
     await publishStatus({ lastCallback: data, lastCallbackAt: Date.now() })
-    if (!userAllowed(from, allowedUsersOf(config))) {
+    if (!userAllowed(from, allowedUsersOf(config)) || !chatAllowed(chat, allowedChatsOf(config))) {
       await call('answerCallbackQuery', { callback_query_id: query.id, text: tr('Access denied', 'Нет доступа'), show_alert: true }, signal, 5000).catch(() => {})
       return
     }
@@ -3366,6 +3398,10 @@ export function apply(ctx, config) {
     const ref = colon === -1 ? '' : data.slice(colon + 1)
     await call('answerCallbackQuery', { callback_query_id: query.id }, signal, 5000).catch(() => {})
     try {
+      if (['m', 'e', 'p'].includes(prefix) || (prefix === 'o' && ['model', 'effort', 'mode'].includes(ref))) {
+        await sendPlain(chat.id, 'Модель и разрешения меняются в Web DSH. Открытие темы сохраняет текущие настройки.', signal, threadId)
+        return
+      }
       if (prefix === 'a') {
         const [action, id] = ref.split(':')
         const pending = pendingApprovals.get(id)
@@ -3504,7 +3540,7 @@ export function apply(ctx, config) {
    * @param signal - request lifetime.
    */
   async function createNewSessionTopic(chatId, controlThreadId, signal, cwd, initialText = '', initialAttachments = []) {
-    await publishStatus({ lastCreateTopic: { initialText: initialText.slice(0, 160), controlThreadId } })
+    await publishStatus({ lastCreateTopic: { controlThreadId } })
     // A command must never be forwarded into a new session as a prompt.
     if (initialText.trim().startsWith('/')) {
       await send(chatId, tr('Unknown command. /help lists commands.', 'Неизвестная команда. /help — список.'), signal, controlThreadId)
@@ -3561,6 +3597,7 @@ export function apply(ctx, config) {
    * @returns resolves after the reply attempt.
    */
   async function handleMessage(message, signal, type = 'message') {
+    incomingMessageId = message.message_id
     const text = message.text
     const from = message.from
     const chat = message.chat
@@ -3596,7 +3633,10 @@ export function apply(ctx, config) {
     await publishStatus({
       lastOutcome: allowedUser && allowedChat ? 'allowed' : 'denied',
     })
-    if (allowedUser && allowedChat) await rememberControlChat(chat.id)
+    if (allowedUser && allowedChat) {
+      await claimOwner(from, chat)
+      await rememberControlChat(chat.id)
+    }
     if (!allowedUser || !allowedChat) {
       // Setup hint: an empty user list is the first-run state. Tell a private
       // caller their ids once, so they can be pasted into Settings. Once the
@@ -3644,8 +3684,8 @@ export function apply(ctx, config) {
     const parts = text.trim().split(/\s+/u)
     const command = normalizeCommand(parts[0])
     await publishStatus({
-      lastCommand: command,
-      lastMessageText: text.slice(0, 160),
+      lastCommand: command.startsWith('/') ? command : '[message]',
+      lastMessageText: '[not recorded]',
       lastInSession: inSession,
       lastThreadId: threadId ?? null,
     })
@@ -3685,7 +3725,7 @@ export function apply(ctx, config) {
             ? `${tr('Current session', 'Текущая сессия')}: <code>${chatState.sessionId}</code>\n`
             : `${tr('Global topic. Choose a session or create a new one.', 'Глобальный чат. Выбери сессию или создай новую.')}\n`) +
           `\n<b>${tr('First run', 'Первый запуск')}:</b> @BotFather → Bot Settings → <b>Threaded mode</b> → ${tr('Enable', 'Включить')}.\n` +
-          `${tr('Commands', 'Команды')}: /sessions, /current, /menu, /rename, /fork, /last, /stop, /restart, /status, /id, /ping.`,
+          `${tr('Commands', 'Команды')}: /sessions, /new, /watch, /bind, /current, /menu, /rename, /last, /stop, /restart, /status, /id, /ping.`,
         signal,
         threadId,
       )
@@ -3710,6 +3750,68 @@ export function apply(ctx, config) {
       return
     }
 
+
+    if (command === '/watch') {
+      const option = parts[1]
+      const workspaces = ctx.get('workspaceRegistry')?.list() ?? []
+      if (option === 'off') { state.subscription.paused = true; releaseInteractions() }
+      else if (option === 'all') {
+        state.subscription.paused = false
+        state.subscription.workspaceIds = workspaces.map((entry) => entry.id)
+      } else if (option === 'on') state.subscription.paused = false
+      else if (option) {
+        const workspace = option === 'here' && inSession
+          ? (await assertOrdinarySession(ctx, chatState.sessionId, signal)).workspace
+          : workspaces.find((entry) => entry.id === option)
+        if (!workspace) throw new Error('Choose a registered workspace id from /watch')
+        state.subscription.paused = false
+        state.subscription.workspaceIds = [...new Set([...(state.subscription.workspaceIds ?? []), workspace.id])]
+      }
+      if (option) {
+        releaseInteractions()
+        state.subscription.generation = (state.subscription.generation ?? 0) + 1
+      }
+      await persistState()
+      if (option) await sessionWatch.reconcile()
+      const selected = state.subscription.workspaceIds ?? []
+      await sendPlain(chat.id, `Сопровождение: ${state.subscription.paused ? 'выключено' : 'включено'}.\n` +
+        'Автотемы создаются только для работающих обычных сессий выбранных проектов. Текст новых ответов передаётся Telegram. История не пересылается.\n' +
+        workspaces.map((entry) => `${selected.includes(entry.id) ? '✓' : '○'} ${entry.title || basename(entry.path)} — ${entry.id}`).join('\n') +
+        '\n/watch <id> · /watch here · /watch all · /watch off · /watch on\nРучные привязки также сопровождаются, пока режим включён.', signal, threadId)
+      return
+    }
+    if (command === '/bind') {
+      if (isAllThread(threadId) || !parts[1]) throw new Error('Use /bind <session-id> in the existing session topic')
+      const sessionId = parts[1]
+      const { row } = await assertOrdinarySession(ctx, sessionId, signal)
+      const record = state.sessions[sessionId]
+      if ((chatState.sessionId && chatState.sessionId !== sessionId)
+        || (record && (record.chatId !== chat.id || record.threadId !== threadId))) {
+        await sendPlain(chat.id, 'Перенос привязок между сессиями и темами запрещён. Открой отдельную тему через /sessions. /bind предназначен только для восстановления свободной темы.', signal, threadId)
+        return
+      }
+      releaseInteractions()
+      await bindSession(chatState, sessionId, await sessionTitle(sessionId), row.cwd)
+      delete state.topicAttempts?.[`${chat.id}:${sessionId}`]
+      delete watchState.bindingErrors[JSON.stringify([chat.id, sessionId])]
+      watchState.bindings[JSON.stringify([chat.id, sessionId])] = state.sessions[sessionId]
+      state.subscription.paused = false
+      state.subscription.generation = (state.subscription.generation ?? 0) + 1
+      await persistState()
+      await sendPlain(chat.id, 'Тема привязана к сессии. Старые события автоматически не пересылаются.', signal, threadId)
+      return
+    }
+    if (command === '/new') {
+      if (parts[1]) {
+        const workspace = ctx.get('workspaceRegistry')?.get(parts[1])
+        if (!workspace) throw new Error('Choose a registered workspace')
+        await createNewSessionTopic(chat.id, threadId, signal, workspace.path)
+      } else if (inSession) {
+        const { workspace } = await assertOrdinarySession(ctx, chatState.sessionId, signal)
+        await createNewSessionTopic(chat.id, threadId, signal, workspace.path)
+      } else await showWorkspaces(chat.id, threadId, signal)
+      return
+    }
 
     if (command === '/current') {
       if (!inSession) {
@@ -3856,7 +3958,7 @@ export function apply(ctx, config) {
       }
       // Telegram may deliver /stop twice (double tap or retry). The first
       // invocation owns cleanup; the duplicate must not enqueue more work.
-      if (chatState.stopping === true || (!chatState.busy && chatState.done)) return
+      if (chatState.stopping === true) return
       chatState.stopping = true
       try {
         chatState.busy = false
@@ -3868,7 +3970,8 @@ export function apply(ctx, config) {
         clearAuxTimers(chatState)
         cancelQuestionsForChat(chatState)
         try {
-          ctx.get('agents')?.get(chatState.sessionId)?.cancel({ kind: 'user' })
+          await assertOrdinarySession(ctx, chatState.sessionId, signal)
+          stopSession(ctx, chatState.sessionId)
         } catch {
           // Already idle or disposed.
         }
@@ -3887,7 +3990,7 @@ export function apply(ctx, config) {
         }
         // The streamed partial answer stays in the first message. Send the
         // marker separately and do not spend time re-editing that message.
-        await send(chat.id, `⏹ ${tr('Stopped.', 'Остановлено.')}`, signal, threadId)
+        await send(chat.id, `⏹ ${tr('Stop requested; pending session input discarded. Background jobs and subagents are separate.', 'Запрошена остановка с очисткой очереди сессии. Фоновые задания и подагенты останавливаются отдельно.')}`, signal, threadId)
         chatState.text = ''
         chatState.lastText = ''
         chatState.messageId = null
@@ -3979,8 +4082,29 @@ export function apply(ctx, config) {
    * @param tokenLifetime - this runtime's lifetime.
    * @returns resolves when polling stops.
    */
+  async function uncertainUpdate(update, signal) {
+    const message = update.message ?? update.callback_query?.message
+    const from = update.message?.from ?? update.callback_query?.from
+    if (!message || !userAllowed(from, allowedUsersOf(config)) || !chatAllowed(message.chat, allowedChatsOf(config))) return
+    await sendPlain(message.chat.id, '⚠️ Операция не подтверждена. Она могла уже выполниться; автоматического повтора не будет. Проверь /sessions, /status и очередь в Web перед повторной отправкой.', signal, message.message_thread_id)
+  }
+  const updateAdmission = createUpdateAdmission({
+    state: () => state, persist: persistState, uncertain: uncertainUpdate,
+    handle: async (update, signal) => {
+      await stateReady
+      if (update.callback_query) {
+        const query = update.callback_query
+        if (userAllowed(query.from, allowedUsersOf(config)) && chatAllowed(query.message?.chat ?? {}, allowedChatsOf(config))) await claimOwner(query.from, query.message.chat)
+        return handleCallback(query, signal)
+      }
+      // Editing a Telegram message must not silently issue a second agent turn.
+      if (update.message) return handleMessage(update.message, signal)
+    },
+  })
+
   async function poll(tokenLifetime) {
-    let offset = 0
+    await stateReady
+    let offset = state.updateOffset ?? 0
     let healthy = false
     let connected = false
     while (!tokenLifetime.signal.aborted) {
@@ -3989,14 +4113,16 @@ export function apply(ctx, config) {
         // Hermes deletes it before starting polling; do the same, without
         // dropping updates that were queued while the bot was down.
         try {
-          await call('deleteWebhook', { drop_pending_updates: false }, tokenLifetime.signal, 10_000)
+          const webhook = await call('getWebhookInfo', {}, tokenLifetime.signal, 10_000)
+          if (webhook?.url) throw new Error('Bot has an active webhook; use a dedicated bot or remove the webhook explicitly')
         } catch (error) {
-          if (!tokenLifetime.signal.aborted) warn(`deleteWebhook failed: ${messageOf(error)}`)
+          throw error
         }
         me = await call('getMe', {}, tokenLifetime.signal)
         startedAt = Date.now()
         healthy = true
         connected = true
+        await sessionWatch.start()
         info(`connected as @${me.username ?? me.id}`)
         await publishStatus({ state: 'running', detail: '', username: me.username ?? String(me.id), startupStage: 'polling' })
         // Menu publication and the startup notice must never delay getUpdates.
@@ -4049,23 +4175,15 @@ export function apply(ctx, config) {
       await publishStatus({ lastPollAt: Date.now() })
       if (!Array.isArray(updates)) continue
       for (const update of updates) {
-        if (typeof update.update_id === 'number') offset = update.update_id + 1
-        await publishStatus({ lastUpdateKeys: Object.keys(update) })
-        if (update.callback_query !== undefined) {
-          void handleCallback(update.callback_query, tokenLifetime.signal).catch((error) => {
-            if (!tokenLifetime.signal.aborted) reportError('callback-handler', error)
-          })
-          continue
-        }
-        const message = update.message ?? update.business_message ?? update.channel_post ?? update.edited_message
-        if (message !== undefined) {
-          const type = Object.keys(update).find((key) => key !== 'update_id') ?? 'unknown'
-          void handleMessage(message, tokenLifetime.signal, type).catch((error) => {
-            if (!tokenLifetime.signal.aborted) reportError('message-handler', error)
-          })
-        } else {
-          const type = Object.keys(update).find((key) => key !== 'update_id') ?? 'unknown'
-          void publishStatus({ lastUpdateType: type, lastUpdateAt: Date.now() })
+        try {
+          await updateAdmission.accept(update, tokenLifetime.signal)
+          offset = Math.max(offset, state.updateOffset ?? 0)
+        } catch (error) {
+          // Leave the claimed update pending. A later delivery warns instead of
+          // risking a second session creation or a duplicated model prompt.
+          reportError('update-admission', new Error('Update outcome needs reconciliation'))
+          await uncertainUpdate(update, tokenLifetime.signal)
+          offset = Math.max(offset, update.update_id + 1)
         }
       }
     }
@@ -4080,8 +4198,18 @@ export function apply(ctx, config) {
     }, 5000)
   }
 
+  function releaseInteractions() {
+    for (const id of [...pendingApprovals.keys()]) settleApproval(id, 'unavailable')
+    for (const pending of [...pendingQuestions.values()]) {
+      pendingQuestions.delete(pending.id)
+      pending.signal?.removeEventListener('abort', pending.onAbort)
+      pending.reject(new Error('Telegram runtime stopped; reopen the question from the session'))
+    }
+  }
+
   /** Stop the active runtime and wait for its loop to settle. */
   async function stop() {
+    releaseInteractions()
     startEpoch += 1
     if (startRetryTimer !== undefined) {
       clearTimeout(startRetryTimer)
@@ -4113,6 +4241,7 @@ export function apply(ctx, config) {
 
   /** Start the runtime if enabled and a token is available. */
   async function startInternal(epoch) {
+    await stateReady
     if (startRetryTimer !== undefined) {
       clearTimeout(startRetryTimer)
       startRetryTimer = undefined
@@ -4220,6 +4349,7 @@ export function apply(ctx, config) {
           clearTimeout(startRetryTimer)
           startRetryTimer = undefined
         }
+        sessionWatch.dispose()
         bridgeAbort.abort()
         void stop().catch((error) => reportError('stop', error))
       }

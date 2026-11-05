@@ -16,8 +16,7 @@ function makeAgent(id, cwd) {
     ctx: { on: (...args) => events.on(...args) },
     status: 'idle',
     received: [],
-    followup(message) { this.received.push(message) },
-    whenIdle() { return new Promise((resolve) => setTimeout(resolve, 20)) },
+    inbox: { clear() {} },
     cancel() {},
   }
 }
@@ -28,13 +27,23 @@ function makeAgent(id, cwd) {
 function makeContext(agent) {
   const cleanups = []
   const logs = []
+  const host = new EventEmitter()
+  const workspace = { id: 'workspace-default', path: '/tmp/default-workspace', title: 'default-workspace', sessionIds: ['one'] }
   const services = {
     credentials: { resolve: async () => ({ value: 'TEST_TOKEN' }) },
-    agents: { get: () => undefined, create: async () => ({ agent }), resume: async () => ({ agent }) },
+    agents: { get: (id) => id === agent.session.id ? agent : undefined },
     sessionController: {
-      createSession: async () => ({ agent }),
-      resume: async () => ({ agent }),
-      fork: async () => ({ sessionId: 'session-fork' }),
+      create: async ({ workspaceId }) => {
+        assert.equal(workspaceId, workspace.id)
+        return { sessionId: agent.session.id }
+      },
+      resolveAgent: async () => ({ agent }),
+      list: async (options) => { assert.deepEqual(options, {}); return { items: [{ sessionId: agent.session.id, blank: false, running: false }] } },
+      prompt: async (request) => {
+        assert.equal(request.mode, 'queue')
+        agent.received.push(request)
+        return { accepted: true }
+      },
     },
     sessionQuery: {
       listSessions: async () => [],
@@ -43,7 +52,8 @@ function makeContext(agent) {
       readSession: async () => ({ events: [] }),
     },
     workspaceRegistry: {
-      list: () => [{ id: 'workspace-default', path: '/tmp/default-workspace', title: 'default-workspace' }],
+      list: () => [workspace],
+      archivedSessionIds: [],
       get: () => undefined,
       create: async () => ({ id: 'workspace-default' }),
     },
@@ -56,7 +66,9 @@ function makeContext(agent) {
     ctx: {
       logger: { info(message) { logs.push(`I ${message}`) }, warn(message) { logs.push(`W ${message}`) } },
       get: (name) => services[name],
-      on() {},
+      sessionController: services.sessionController,
+      workspaceRegistry: services.workspaceRegistry,
+      on(name, listener) { host.on(name, listener); return () => host.off(name, listener) },
       effect(fn) {
         cleanups.push(fn())
       },
@@ -71,6 +83,7 @@ function makeContext(agent) {
 
 test('All message creates one topic, then the same topic continues', async () => {
   const home = await mkdtemp(join(tmpdir(), 'dsh-telegram-test-'))
+  const previousHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
   const agent = makeAgent('session-one', '/tmp/default-workspace')
   const { ctx, cleanup, logs } = makeContext(agent)
@@ -111,8 +124,13 @@ test('All message creates one topic, then the same topic continues', async () =>
                 text: 'hello from All',
               },
             }]
+        } else if (getUpdatesCalls === 2) {
+          result = [{ update_id: 2, message: {
+            message_id: 2, date: 1, chat: { id: 100, type: 'private' }, from: { id: 42 },
+            message_thread_id: 7001, text: 'continue in topic',
+          } }]
         } else {
-          error = { ok: false, description: 'Conflict: terminated by other getUpdates request' }
+          return // Keep the last long poll pending until cleanup aborts it.
         }
       } else {
         result = true
@@ -130,7 +148,7 @@ test('All message creates one topic, then the same topic continues', async () =>
     return request
   }
   try {
-    const { apply } = await import('../index.js')
+    const { apply } = await import(`../index.js?scenario=${encodeURIComponent(home)}`)
     apply(ctx, {
       enabled: true,
       tokenRef: 'TEST_TOKEN',
@@ -140,15 +158,24 @@ test('All message creates one topic, then the same topic continues', async () =>
       language: 'en',
       showThinking: false,
     })
-    await new Promise((resolve) => setTimeout(resolve, 250))
+    const deadline = Date.now() + 2000
+    while (getUpdatesCalls < 3) {
+      assert.ok(Date.now() < deadline, 'updates must settle')
+      await new Promise(setImmediate)
+    }
     const topicCalls = calls.filter((entry) => entry.method === 'createForumTopic')
     assert.equal(topicCalls.length, 1, 'All message must create exactly one topic')
     assert.equal(topicCalls[0].body.name, 'New session')
-    assert.equal(agent.received.length, 1, 'the initial prompt must reach the new agent')
+    assert.equal(agent.received.length, 2, 'initial and continuation prompts reach the same session')
     assert.equal(agent.received[0].content[0].text, 'hello from All')
+    assert.equal(agent.received[1].content[0].text, 'continue in topic')
+    assert.deepEqual(agent.received.map(request => request.requestId), ['telegram:100:1', 'telegram:100:2'])
+    assert.ok(agent.received.every(request => request.sessionId === agent.session.id))
   } finally {
     cleanup()
     https.request = originalRequest
-    await rm(home, { recursive: true, force: true })
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    await rm(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 })
   }
 })
