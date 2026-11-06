@@ -28,8 +28,9 @@ function fixture(options = {}) {
       assert.ok(signal instanceof AbortSignal);
       return {items: options.items ?? []};
     }},
-    on: (name, fn) => {
+    on: (name, fn, options) => {
       assert.equal(name, 'session/event');
+      assert.equal(options?.global, true, 'Host observer must receive scoped Session events');
       listeners.add(fn);
       return () => listeners.delete(fn);
     },
@@ -52,6 +53,28 @@ function fixture(options = {}) {
     emit: (session, e) => [...listeners].map(fn => fn(session, e)),
   };
 }
+
+test('Host services resolve through ctx.get without undeclared Cordis property injection', async () => {
+  const f = fixture({items: [{sessionId: 'one', running: true, blank: false}]});
+  const services = {workspaceRegistry: f.ctx.workspaceRegistry, sessionController: f.ctx.sessionController};
+  f.ctx.get = name => services[name];
+  for (const name of Object.keys(services)) Object.defineProperty(f.ctx, name, {
+    get() { throw new Error('Cannot access sibling service without inject'); },
+  });
+  f.policy.mirrorMessages = true;
+  await f.watch.start();
+  f.emit(root('one'), event('turn/start', 1));
+  f.emit(root('one'), answer(2, 1, 'Actual committed work message'));
+  f.emit(root('one'), event('turn/end', 3, 1, {reason: {kind: 'completed'}}));
+  await f.watch.idle();
+  assert.equal(f.errors.length, 0);
+  assert.deepEqual(f.created, ['one']);
+  assert.equal(f.sent.length, 2);
+  assert.match(f.sent[0].text, /Actual committed work message/);
+  assert.match(f.sent[1].text, /completed/);
+  assert.equal(f.state.sessions.one.cursor, 3);
+  await f.watch.dispose();
+});
 
 test('startup discovers only running nonblank selected root sessions; no history', async () => {
   const f = fixture({items: [

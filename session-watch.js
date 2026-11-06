@@ -122,7 +122,8 @@ export function createSessionWatch({ctx, getPolicy, ensureTopic, send, persist, 
     const header = session?.header ?? session?.meta ?? session;
     // A user fork can have parentSession/isSeeded without subagent ownership.
     if (!header || hasLiveSubagentOwner(ctx, id, header) || (header.delegationDepth ?? 0) > 0) return null;
-    const registry = ctx.workspaceRegistry;
+    const registry = ctx.get?.('workspaceRegistry') ?? ctx.workspaceRegistry;
+    if (!registry?.list) throw new Error('Workspace registry unavailable for session delivery');
     const canonical = canonicalSessionId(id);
     const matches = value => canonicalSessionId(value) === canonical;
     if ((registry.archivedSessionIds ?? []).some(matches)) return null;
@@ -273,7 +274,9 @@ export function createSessionWatch({ctx, getPolicy, ensureTopic, send, persist, 
     if (disposed) return Promise.resolve();
     if (scan) return scan;
     scan = track((async () => {
-      const result = await ctx.sessionController.list({}, abort.signal);
+      const controller = ctx.get?.('sessionController') ?? ctx.sessionController;
+      if (!controller?.list) throw new Error('Session controller unavailable for session delivery');
+      const result = await controller.list({}, abort.signal);
       for (const summary of result.items) {
         if (disposed) break;
         const policy = policyFor(summary.sessionId, summary);
@@ -288,7 +291,7 @@ export function createSessionWatch({ctx, getPolicy, ensureTopic, send, persist, 
   function start() {
     if (!started && !disposed) {
       started = true;
-      try { unsubscribe = ctx.on('session/event', listener); }
+      try { unsubscribe = ctx.on('session/event', listener, {global: true}); }
       catch (error) { started = false; report(error, 'subscribe'); return Promise.resolve(); }
       return reconcile();
     }

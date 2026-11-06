@@ -617,7 +617,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0-dev.1',
   agentBridge: 'v1',
-  codeRevision: 'multi-history-web-mirror-2',
+  codeRevision: 'multi-history-web-mirror-3',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -857,7 +857,7 @@ export function apply(ctx, config) {
           await call('sendMessage', { chat_id: chat.chatId, message_thread_id: chat.threadId, text: chunk }, bridgeAbort.signal, 30_000, generation)
         }
       },
-      onError: () => warn('Session delivery paused or failed; check Telegram status and /watch.'),
+      onError: (error, context) => reportError(`watch-${context.operation}`, error),
     }))
     return watchers.get(chatId)
   }
@@ -891,7 +891,7 @@ export function apply(ctx, config) {
         await applyTopicTitle(chat, event.data?.title)
       })
     }
-  })
+  }, { global: true })
 
   // Own foreground questions only for explicitly bound, authorized sessions.
   // Never await topic creation in an approval boundary or resurrect cold agents.
@@ -1421,7 +1421,7 @@ export function apply(ctx, config) {
    * @param error - failure.
    */
   function reportError(scope, error) {
-    const detail = messageOf(error)
+    const detail = redactTelegramText(messageOf(error))
     const kind = classifyError(error)
     warn(`${scope} [${kind}]: ${detail}`)
     void publishStatus({

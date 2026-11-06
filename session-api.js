@@ -17,7 +17,7 @@ export function hasLiveSubagentOwner(ctx, sessionId, header) {
   if (header?.origin === 'subagent') return true
   const parentId = header?.parentSession ?? header?.parentSessionId
   if (!parentId) return false
-  const agents = ctx.agents ?? ctx.get?.('agents')
+  const agents = ctx.get?.('agents') ?? ctx.agents
   const agent = agents?.get(sessionId)
   const parent = agents?.get(parentId)
   if (!agent || !parent) return false // ordinary cold forks remain eligible
