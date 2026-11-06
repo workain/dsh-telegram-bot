@@ -425,6 +425,7 @@ test('restart retains topic and durable event cursor without replaying prior out
 
 test('Host Web events route to watched topic; native queued prompts deduplicate; watch off revokes delivery', async () => {
   const host = await hostScenario()
+  host.config.showToolCalls = true // Explicit opt-in; ordinary deployments keep tool notices off.
   try {
     await host.feed(update(1, '/watch all'))
     host.emit('session-web', 10, 'turn/start', { turn: 3, source: 'web' })

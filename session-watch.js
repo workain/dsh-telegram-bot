@@ -235,7 +235,7 @@ export function createSessionWatch({ctx, getPolicy, ensureTopic, send, persist, 
           record.turns[turn] = {...record.turns[turn], text: ''};
         } else record.turns[turn] = {...record.turns[turn], text: hasTools ? '' : text};
       }
-    } else if (event.type === 'tool/call') {
+    } else if (event.type === 'tool/call' && getPolicy().showToolCalls !== false) {
       // Names are identifiers, not arbitrary free-form progress descriptions.
       const name = typeof data.name === 'string' && /^[\w./:-]{1,80}$/.test(data.name)
         ? data.name : 'tool';

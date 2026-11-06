@@ -54,6 +54,24 @@ function fixture(options = {}) {
   };
 }
 
+test('disabled tool notices do not hide real work messages or turn completion', async () => {
+  const f = fixture();
+  f.policy.mirrorMessages = true;
+  f.policy.showToolCalls = false;
+  await f.watch.start();
+  f.emit(root('one'), event('turn/start', 1));
+  f.emit(root('one'), event('tool/call', 2, 1, {name: 'synthetic_tool'}));
+  f.emit(root('one'), answer(3, 1, 'User-visible work update'));
+  f.emit(root('one'), event('turn/end', 4, 1, {reason: {kind: 'completed'}}));
+  await f.watch.idle();
+  assert.equal(f.sent.length, 2);
+  assert.ok(f.sent.every(item => !item.text.includes('Tool:')));
+  assert.match(f.sent[0].text, /User-visible work update/);
+  assert.match(f.sent[1].text, /completed/);
+  assert.equal(f.state.sessions.one.cursor, 4);
+  await f.watch.dispose();
+});
+
 test('Host services resolve through ctx.get without undeclared Cordis property injection', async () => {
   const f = fixture({items: [{sessionId: 'one', running: true, blank: false}]});
   const services = {workspaceRegistry: f.ctx.workspaceRegistry, sessionController: f.ctx.sessionController};

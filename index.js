@@ -446,7 +446,7 @@ export const Config = z.object({
   /** Mirror model reasoning deltas into the session topic. */
   showThinking: z.boolean().default(true).volatile(),
   /** Mirror tool calls into the session topic. */
-  showToolCalls: z.boolean().default(true).volatile(),
+  showToolCalls: z.boolean().default(false).volatile(),
 })
 
 /**
@@ -617,7 +617,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0-dev.1',
   agentBridge: 'v1',
-  codeRevision: 'multi-history-web-mirror-3',
+  codeRevision: 'multi-history-web-mirror-4',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -742,6 +742,7 @@ export function apply(ctx, config) {
       workspaceIds: owner.workspaceIds ?? [],
       generation: (owner.generation ?? 0) + startEpoch,
       mirrorMessages: true,
+      showToolCalls: readLive(config.showToolCalls, false),
       historyThroughSeqs: Object.fromEntries(Object.values(state.sessions).filter(record => record.chatId === chatId && Math.max(record.historyThroughSeq ?? -1, record.history?.throughSeq ?? -1) >= 0).map(record => [record.sessionId, Math.max(record.historyThroughSeq ?? -1, record.history?.throughSeq ?? -1)])),
       boundSessionIds: Object.values(state.sessions).filter((record) => record.chatId === owner.chatId).map((record) => record.sessionId),
     }
