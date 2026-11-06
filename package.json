@@ -1,6 +1,6 @@
 {
-  "name": "dsh-telegram-bot",
-  "version": "0.2.0",
+  "name": "@workain/dsh-telegram-bot",
+  "version": "0.3.0-dev.1",
   "description": "Telegram sessions, topics, model controls and approvals for DeepSeek Harness.",
   "type": "module",
   "main": "index.js",
@@ -13,11 +13,21 @@
   },
   "files": [
     "index.js",
+    "session-api.js",
+    "session-watch.js",
+    "state-validation.js",
+    "session-selection.js",
+    "user-access.js",
+    "topic-recovery.js",
+    "session-history.js",
+    "mirrored-interaction.js",
+    "session-link.js",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
     "README.md",
+    "ACCEPTANCE.md",
     "CREDITS.md",
     "docs"
   ],
@@ -31,7 +41,8 @@
       "inject": [
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-plugin-manager"
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-client-ui-workspace"
       ]
     }
   },
@@ -53,11 +64,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Boobaw/dsh-telegram-bot.git"
+    "url": "git+https://github.com/workain/dsh-telegram-bot.git"
   },
-  "homepage": "https://github.com/Boobaw/dsh-telegram-bot#readme",
+  "homepage": "https://github.com/workain/dsh-telegram-bot#readme",
   "bugs": {
-    "url": "https://github.com/Boobaw/dsh-telegram-bot/issues"
+    "url": "https://github.com/workain/dsh-telegram-bot/issues"
   },
   "scripts": {
     "test": "NODE_ENV=test node --test"

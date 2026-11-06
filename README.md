@@ -1,185 +1,120 @@
-# dsh-telegram-bot
+# Workain Telegram для DSH
 
-[![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/boobaw/dsh-telegram-bot)
+Предварительная версия пульта доверенной рабочей машины. Одна тема Telegram — одна **та же исходная сессия** DeepSeek Harness: Web и Telegram используют общий контекст и штатную очередь. Возможности preview развиваются; синтетические проверки не означают приёмку доставки на всех устройствах или готовность к эксплуатации.
 
-Telegram client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). It connects a DSH profile to a Telegram bot and keeps the same DSH sessions available in both interfaces.
+Ответвление [Boobaw/dsh-telegram-bot](https://github.com/Boobaw/dsh-telegram-bot), основа — commit `85be22527e51b912ca4c3c4bfdb907bb0a7eefa7` (upstream 0.2.0). Авторство и MIT сохранены; Workain — отдельная разработка, не официальный плагин DeepSeek.
 
-## Demo
+## Сессии и сообщения
 
-First setup: https://youtu.be/QEeVucfBsWk
+- Выбор через `s/c/f` сразу открывает тему **точной исходной сессии**, без fork. `/fork` отключён.
+- `/sessions` предлагает три массовые кнопки глобально и внутри проекта: работающие, за последний час, за сутки. «Работающие» означает штатное `running=true`, а не наличие загруженного объекта; интервалы считаются по штатному `updatedAt`.
+- `/connect running|hour|day [workspace]` подключает соответствующую выборку.
+- `/watch` выбирает проекты для автоматических тем обычных корневых сессий, включая запущенные из Web. Выбор сохраняется отдельно для каждого личного чата и не сбрасывается при действиях другого оператора.
+- В тему поступают настоящий человеческий текст из Web и зафиксированный текст assistant независимо от источника запуска. Рассуждения, сырые аргументы и результаты инструментов не пересылаются.
+- Одно сообщение DSH соответствует одному сообщению Telegram; слишком длинное сообщение разбивается по лимитам Telegram. История не объединяется в один общий текст.
+- Сообщение во время работы поступает в штатную очередь той же сессии без прерывания хода, fork, подмены модели или разрешений.
+- Завершение хода не означает завершение всей длительной цели.
+- Отдельные уведомления `Tool: …` по умолчанию выключены (`showToolCalls=false`). Это не скрывает человеческие сообщения, текст assistant, вопросы или завершение хода.
 
-Installation, bot token, the allowlist, `/start`, `/sessions` and a test prompt.
+## История
 
-### Enable Threaded mode
+При подключении тема получает последний час истории: человеческие сообщения с `sourceKind=user` и текст assistant. Кнопка старых сообщений и `/history older` запрашивают предыдущую порцию явно. В одной порции — не более 200 исходных сообщений; продолжение требует нового запроса, а не выгружает всю историю автоматически.
 
-<p align="center">
-  <a href="docs/threaded-mode.gif">
-    <img src="docs/threaded-mode.gif" alt="BotFather: Bot Settings → Threaded mode → Enable" width="320">
-  </a>
-</p>
+Граница начальной выборки фиксируется для привязки. Учёт уже отправленных последовательностей истории и нижняя граница живых событий предотвращают обычную повторную рассылку при новых ходах и перезапусках. Это не обещание сетевой доставки «ровно один раз».
 
-BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow users to create new threads**, so Telegram does not create a topic for every message sent in All.
+Миграция на формат «одно сообщение — одно сообщение» отдельно **один раз** переиздаёт текущий последний час. Старые объединённые сообщения автоматически не удаляются.
 
-## Features
+## Требования и доверие
 
-- One Telegram topic per DSH session; Web and Telegram use the same session.
-- Telegram mirrors only turns initiated from Telegram; turns started in the Web UI stay in Web.
-- `/sessions` lists workspaces and existing sessions, and can create a new session in a selected workspace.
-- Assistant answers stream into the topic with Telegram Markdown formatting.
-- Reasoning and tool calls are shown as temporary messages and removed after the answer. Each tool-call entry is capped at two lines.
-- Inline controls for model, reasoning effort, permission mode and context usage.
-- Tool approvals with **Deny** / **Allow** buttons.
-- `ask_user_question` support: options, multi-select, custom answers and plan review.
-- Documents and photos sent in a session topic are saved as DSH attachments and passed to the agent.
-- `/last`, `/rename`, `/fork`, `/stop`, `/restart`, `/status` and `/menu`.
-- `/fork [name]` creates a DSH session fork in a new Telegram topic; without a name it uses the previous title plus the branch number.
-- The session picker also has **🔀 Continue in Telegram fork**; automatic fork topics end with `(N)`.
-- English and Russian bot messages.
-- Bot token stays in the DSH credential store.
+- Node.js 22+, DSH `>=0.2.1-rc.2 <0.3.0`; целевая линия — DSH 0.2.1.
+- Существующий процесс `dsh web`, управляющий нужными сессиями; второй Host для записи в те же журналы не нужен.
+- Выделенный Telegram-бот, исходящий HTTPS и long polling. Webhook и открытие входящего порта для бота не нужны.
+- В BotFather: **Bot Settings → Threaded mode → Enable**, затем **Disallow users to create new threads**. В личном чате бота включить **Topics**.
+- Допускается несколько доверенных операторов: числовые Telegram ID и логины с необязательным `@`, без учёта регистра. **Числовой ID рекомендуется**.
+- Логин закрепляется за стабильным Telegram ID по первому аутентифицированному update. Попытка другого ID использовать тот же логин отклоняется; логин сам по себе не является неизменной личностью.
+- Только личные чаты: у каждого независимые привязки, выбор `/watch` и сопровождение. Группы и каналы не являются этим режимом доступа.
+- Это **не** разграничение прав по проектам: каждый допущенный оператор доверен на уровне всей машины и имеет доступ ко всем её проектам. Пустой allowlist запрещает доступ.
+- Не устанавливать одновременно с upstream: общий идентификатор настроек `telegram-bot`. Один bot token — один poller.
 
-## Requirements
+## Установка preview
 
-- DSH `0.2.1-rc.2` or newer, Node.js 22+.
-- A Telegram bot token from [@BotFather](https://t.me/BotFather).
-- **Threaded mode** enabled in BotFather, **Topics** enabled in the bot chat, and **Disallow users to create new threads** enabled.
-
-## Install
-
-From this repository:
+npm-релиза Workain пока нет. Из корня проверенного checkout **только поддерева плагина**:
 
 ```bash
-npx @deepseek-ai/dsh plugin --profile web add .
+npm ci --ignore-scripts
+npm test
+dsh plugin --profile web add link:$PWD
 ```
 
-From npm:
+Используйте существующий Web-профиль. Подключение bundle может потребовать безопасного перезапуска этого же DSH; не запускайте заменяющий Web-сервер. Браузерный клиент Workain также должен загрузиться: обновите страницу Web после установки/обновления.
+
+В **Settings → Telegram**:
+
+1. Сохраните bot token через секретное поле, не отправляя его агенту или в чат.
+2. В **Allowed users** укажите доверенные числовые ID и/или логины. В **Allowed chats**, если ограничение нужно, укажите личные чаты этих операторов.
+3. Настройте **Web DSH address**, если нужен доступ к Web с телефона; правила ниже.
+4. Выберите язык, включите бота, отправьте `/start`, затем `/sessions`.
+5. Проверьте тестовую сессию и обмен сообщениями в обе стороны, затем явно настройте `/watch` в каждом личном чате.
+
+## Закреплённая ссылка на точную сессию
+
+Модуль `session-link.js` строго проверяет публичный базовый URL, отправляет и закрепляет в теме ссылку с `?dshSession=<id>`. Браузерный плагин Workain открывает именно эту сессию через штатный `ctx.uiWorkspace.openSession`.
+
+**Сам DSH 0.2.1 не маршрутизирует этот URL к сессии**: нужен загруженный клиент Workain и обновление страницы Web. Обычная браузерная аутентификация DSH остаётся обязательной; ссылка не предоставляет доступ сама по себе.
+
+Необязательное поле **Web DSH address**: пустое значение берёт origin текущего Host, часто localhost, доступный только на самой машине. Для телефона владелец задаёт достижимую базу через свой VPN или reverse proxy. Плагин **никогда не открывает порты автоматически**.
+
+Базовый URL не должен содержать токены авторизации, query-параметры или userinfo: такие базы отклоняются для предотвращения утечки секретов. В закреплённую ссылку добавляется только идентификатор сессии `dshSession`, не секреты или параметры авторизации.
+
+ID отправленного сообщения сохраняется устойчиво **до** закрепления. При отсутствии прав закрепления повторяется pin того же ID, а не отправка новой ссылки. Неизвестный исход отправки ссылки блокирует автоматический повтор: нужна ручная сверка, а не стирание блокировки.
+
+## Команды
+
+| Команда | Результат |
+|---|---|
+| `/sessions` | Выбор проекта/исходной сессии; три массовых подключения глобально и в проекте |
+| `/connect running\|hour\|day [workspace]` | Подключение выбранного набора сессий |
+| `/new [workspace-id]` | Новая сессия со штатной конфигурацией; без контекста — выбор проекта |
+| `/fork` | Отключено; исходная сессия не копируется |
+| `/watch`, `/watch <workspace-id>`, `/watch here` | Просмотр/выбор проектов текущего личного чата |
+| `/watch all` | Явный выбор всех сейчас зарегистрированных проектов; будущие проекты не добавляются сами |
+| `/watch off`, `/watch on` | Пауза и возобновление сохранённого сопровождения этого чата |
+| `/history older` | Явная предыдущая порция истории, максимум 200 исходных сообщений |
+| `/last [1..5]` | Явный запрос последних ответов |
+| `/bind <session-id>` | Привязка свободной темы или подтверждение той же пары; перенос идентичности запрещён |
+| `/retry <session-id>` | Кнопка явного подтверждения повтора создания темы после ручной проверки её отсутствия |
+| `/stop` | Штатная остановка агента и очистка очереди; фоновые задания/подагенты — отдельно |
+| `/status`, `/current`, `/rename <имя>` | Состояние, текущая сессия, имя темы |
+| `/restart` | Перезапуск только Telegram runtime, не DSH |
+
+Архивные сессии и подагенты исключаются из автоматического обнаружения; обычные пользовательские forks допустимы как исходные сессии, но Telegram их не создаёт. Обнаружение не запускает холодную сессию само по себе.
+
+## Вопросы, разрешения и сбои
+
+- Вопросы и approvals одновременно доступны в Web **и** Telegram. Первый действительный ответ побеждает, проигравшая ветка закрывается; устаревшие кнопки не отвечают на следующий запрос.
+- Политика `never` никогда не обходится. Отключение Telegram, `/watch off` или dispose освобождают только Telegram-ветку: Web остаётся доступен. Зеркало не отменяет исходные native signals.
+- Входящие updates обрабатываются последовательно; устойчивый ID сообщения используется как `requestId`, намерение фиксируется до побочного действия. Неизвестный результат не повторяется автоматически.
+- При определённом отказе Bot API 4xx создание темы снимает ожидание; timeout/неизвестный исход оставляет блокировку повтора. Сначала осмотрите темы. Если тема существует — используйте её и `/bind`, без переноса идентичности. Только после проверки отсутствия используйте `/retry` и явное подтверждение.
+- Неизвестная отправка ссылки требует отдельной ручной сверки; `/retry` создания темы не разрешает автоматически стереть её блокировку. Не удаляйте состояние ради обхода ошибки.
+- События одной сессии упорядочены; сбой Telegram не останавливает агент DSH. После паузы нет автоматической рассылки всего пропущенного. Повреждённые привязки блокируют запуск вместо пересоздания тем.
+- Отзыв допуска запрещает новые отправки и callbacks; уже отправленный запрос отозвать задним числом нельзя.
+
+## Данные и публикация
+
+Токен хранится через credentials DSH по ссылке `TELEGRAM_BOT_TOKEN`. Приватное состояние в `telegram-workain` внутри DSH home — **незашифрованный открытый текст**: привязки, ID операторов/чатов/сообщений, фрагменты текста, последовательности истории и сведения о закреплениях. Доступ к учётной записи ОС означает доступ к этим данным; снимки не публикуют.
+
+Маскирование известных форматов секретов не гарантирует очистку всех конфиденциальных данных. Telegram получает выбранные тексты, вопросы и названия сессий. Не выбирайте недопустимые для передачи проекты. Это описание не является юридической гарантией или заявлением о соответствии требованиям.
+
+Плагин выполняется с правами пользователя Host. Бот не удаляет чужой webhook автоматически. В GitHub публикуется только поддерево плагина, без приватного состояния, токенов, локальных путей и материалов рабочей машины. Лицензия MIT и благодарности upstream и [telegramify-markdown](https://github.com/skoropadas/telegramify-markdown) сохраняются.
+
+## Проверки и статус
 
 ```bash
-npx @deepseek-ai/dsh plugin --profile web add dsh-telegram-bot@latest
-```
-
-Restart `dsh web` after installing or updating the plugin. Then open **Settings → Telegram**.
-
-## Configure
-
-| Field | Meaning |
-| --- | --- |
-| Bot token | Token from @BotFather; stored in the credential store |
-| `tokenRef` | Credential/env name for the token; default `TELEGRAM_BOT_TOKEN` |
-| `cwd` | Working directory for Telegram-created sessions |
-| `agentPreset` | Preset mounted for Telegram sessions; default `standard` |
-| Allowed users | Telegram user ids or `@usernames` |
-| Allowed chats | Telegram chat ids or `@channelnames` |
-| Show model thinking | Show reasoning in a temporary message |
-| Show tool calls | Show tool calls in a temporary message |
-| Bot language | `en` (default) or `ru` |
-| Enable bot | Start or pause Telegram polling |
-
-The token field only reports whether a token is configured. A token supplied through the environment cannot be overwritten from the page.
-
-## First run
-
-1. Create a bot with @BotFather and save its token in **Settings → Telegram**.
-2. In @BotFather open **Bot Settings → Threaded mode**, enable it, and enable **Disallow users to create new threads**.
-3. Open the bot chat, tap the bot name and enable **Topics**.
-4. Send `/start` in **All**. With an empty allowlist the bot replies with your user and chat ids.
-5. Add your user id to **Allowed users** and press **Save**.
-6. Send `/sessions` in **All**, choose a workspace and open or create a session.
-7. Send a test message in the new topic.
-
-An ordinary message in **All** creates a new session topic in the default workspace. Commands such as `/sessions`, `/fork` and `/last` still work in All.
-
-If users are allowed to create threads, Telegram creates a topic before the bot receives the message; the bot then warns about the BotFather setting on startup.
-
-## Troubleshooting topics
-
-If every message in **All** creates a new topic, enable this BotFather option:
-
-**Bot Settings → Threaded mode → Disallow users to create new threads**
-
-The bot checks `has_topics_enabled` and `allows_users_to_create_topics` on startup, writes them to `~/.dsh/telegram/status.json`, and posts a warning in the control chat when either setting is wrong.
-
-A correct configuration contains:
-
-```json
-"threadedMode": true,
-"usersCanCreateTopics": false
-```
-
-## Plugins page
-
-The plugin page is informational. It points to **Settings → Telegram** and lists the manual configuration files. Use the bundle switch there to enable or disable the plugin; **Enable bot** is a soft pause that keeps the plugin loaded but stops polling.
-
-## Headless profile
-
-The bot can run without the Web UI:
-
-```bash
-mkdir -p ~/.dsh/profiles/tg
-cd ~/.dsh/profiles/tg
-```
-
-`package.json`:
-
-```json
-{
-  "name": "dsh-profile-tg",
-  "private": true,
-  "dependencies": { "dsh-telegram-bot": "latest" },
-  "dsh": {
-    "profile": {
-      "bundles": ["@deepseek-ai/dsh-base", "dsh-telegram-bot"]
-    }
-  }
-}
-```
-
-`cordis.patch.yml`:
-
-```yaml
-- id: telegram-bot
-  name: dsh-telegram-bot
-  config:
-    enabled: true
-    allowedUsers: ["<user-id>"]
-    allowedChats: ["<chat-id>"]
-```
-
-Install and run:
-
-```bash
-npm install
-printf 'TELEGRAM_BOT_TOKEN=%s\n' '<token>' >> ~/.dsh/.env
-chmod 600 ~/.dsh/.env
-npx @deepseek-ai/dsh --profile tg
-```
-
-Do not put the token in `cordis.patch.yml`.
-
-## Security
-
-- The bot token lives in the credential store, not in the profile patch.
-- Empty **Allowed users** answers only in private chats with the setup hint.
-- Group and channel chats require an entry in **Allowed chats**.
-- Do not run two pollers with the same token; Telegram returns `409 Conflict`.
-- A DSH plugin runs in-process with the Host. Install only source you trust.
-
-## Development
-
-No build step is needed.
-
-```bash
-npm install
+npm ci --ignore-scripts
 node --check index.js
 node --check client.js
 npm test
+npm pack --dry-run
 ```
 
-`index.js` is the Host half: Telegram polling, topic routing and the session bridge. `client.js` registers the Settings page and the Plugins-page note. The plugin adds no model-facing tools or system-prompt text; it connects Telegram to the existing DSH agent.
-
-## License
-
-MIT
-
-## Credits
-
-Markdown to Telegram formatting uses [telegramify-markdown](https://github.com/skoropadas/telegramify-markdown) (MIT).
+Автотесты выполняются без реальной сети, токенов и платной модели. Дополнительный native-fixture использует установленные Cordis/Session, проверяя доступ через `ctx.get()` и scoped-события; путь можно задать `DSH_NATIVE_ROOT`. Без установленных native-модулей этот fixture явно пропускается, а не выдаётся за пройденную проверку. Реальная доставка, закрепление, браузерный переход и гонки ответов ещё проверяются отдельным приёмочным прогоном на устройствах. Preview не объявлен принятым в эксплуатацию; результаты конкретного устройства не означают приёмку всех остальных.

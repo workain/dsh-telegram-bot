@@ -8,32 +8,59 @@ import https from 'node:https'
 
 function makeAgent(id, cwd, idleMs) {
   const events = new EventEmitter()
+  const operations = [], pending = []
   return {
     session: { id, header: { cwd }, append() {} },
     ctx: { on: (...args) => events.on(...args) },
     events,
     status: 'idle',
     received: [],
-    followup(message) { this.received.push(message) },
-    whenIdle() { return new Promise((resolve) => setTimeout(resolve, idleMs)) },
-    cancel() {},
+    cancellations: [],
+    operations,
+    inbox: { pending, clear() { operations.push('clear'); pending.splice(0) } },
+    cancel(reason) { operations.push('cancel'); this.cancellations.push(reason) },
   }
 }
 
 function makeContext(agent) {
   const logs = []
   const cleanups = []
-  const attachments = {
-    async saveFile({ data, name }) { return { attachmentId: 'file-1', name: name ?? 'file', bytes: data.length } },
-    async saveImage({ data, name, mediaType }) { return { attachmentId: 'image-1', name: name ?? 'image', bytes: data.length, mediaType, width: 1, height: 1 } },
+  const uploads = []
+  const fileUploads = {
+    async upload(receiver, request, signal) {
+      assert.equal(receiver, agent, 'receipt is scoped to the exact receiving agent')
+      assert.ok(signal instanceof AbortSignal)
+      assert.equal(signal.aborted, false)
+      assert.deepEqual(request, { data: Buffer.from('file-data').toString('base64'), name: 'test.txt' })
+      uploads.push({ receiver, request })
+      return { receiptId: 'receipt-test-file' }
+    },
   }
+  const host = new EventEmitter()
+  const workspace = { id: 'workspace-default', path: '/tmp/default-workspace', title: 'default-workspace', sessionIds: ['one'] }
+  const rows = [{ sessionId: agent.session.id, blank: false, running: false }]
   const services = {
     credentials: { resolve: async () => ({ value: 'TEST_TOKEN' }) },
-    agents: { get: () => undefined, create: async () => ({ agent }), resume: async () => ({ agent }) },
+    agents: { get: (id) => id === agent.session.id ? agent : undefined },
     sessionController: {
-      createSession: async () => ({ agent }),
-      resume: async () => ({ agent }),
-      fork: async () => ({ sessionId: 'session-fork' }),
+      create: async (options) => {
+        assert.equal(options.workspaceId, workspace.id)
+        return { sessionId: agent.session.id }
+      },
+      resolveAgent: async () => ({ agent }),
+      list: async (options) => { assert.deepEqual(options, {}); return { items: rows } },
+      prompt: async (request) => {
+        assert.equal(request.mode, 'queue')
+        agent.received.push(request)
+        agent.inbox.pending.push(request)
+        return { accepted: true }
+      },
+      fork: async () => {
+        agent.operations.push('fork')
+        rows.push({ sessionId: 'session-fork', blank: false, running: false })
+        workspace.sessionIds.push('fork')
+        return { sessionId: 'session-fork' }
+      },
     },
     sessionQuery: {
       listSessions: async () => [],
@@ -42,21 +69,26 @@ function makeContext(agent) {
       readSession: async () => ({ events: [] }),
     },
     workspaceRegistry: {
-      list: () => [{ id: 'workspace-default', path: '/tmp/default-workspace', title: 'default-workspace', attachSession() {} }],
+      list: () => [workspace],
+      archivedSessionIds: [],
       get: () => undefined,
       create: async () => ({ id: 'workspace-default' }),
     },
-    attachments,
+    fileUploads,
     llm: { listModels: async () => [], resolveModel: async () => ({ context: { contextWindow: 1_000_000 } }) },
   }
   return {
     ctx: {
       logger: { info(message) { logs.push(`I ${message}`) }, warn(message) { logs.push(`W ${message}`) } },
       get: (name) => services[name],
-      on() {},
+      sessionController: services.sessionController,
+      workspaceRegistry: services.workspaceRegistry,
+      on(name, listener) { host.on(name, listener); return () => host.off(name, listener) },
       effect(fn) { cleanups.push(fn()) },
     },
     logs,
+    host,
+    uploads,
     cleanup: () => { for (const fn of cleanups) fn?.() },
   }
 }
@@ -66,6 +98,7 @@ function makeTelegram(updates) {
   let messageId = 0
   let topicId = 7000
   let updateIndex = 0
+  let drained = false
   const fake = (options, callback) => {
     const method = String(options.path).split('/').pop()
     const request = new EventEmitter()
@@ -107,11 +140,11 @@ function makeTelegram(updates) {
       if (method === 'getUpdates') {
         const update = updates[updateIndex]
         if (update === undefined) {
-          deliver(JSON.stringify({ ok: false, description: 'Conflict: terminated by other getUpdates request' }))
+          drained = true
           return
         }
         updateIndex += 1
-        setTimeout(() => deliver(JSON.stringify({ ok: true, result: [update] })), update.delay ?? 0)
+        deliver(JSON.stringify({ ok: true, result: [update] }))
         return
       }
       let result = true
@@ -130,11 +163,20 @@ function makeTelegram(updates) {
     }
     return request
   }
-  return { fake, calls, get calls() { return calls } }
+  return { fake, calls, get drained() { return drained } }
+}
+
+async function until(predicate, detail = 'expected event') {
+  const deadline = Date.now() + 2000
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, `Timed out: ${detail}`)
+    await new Promise(setImmediate)
+  }
 }
 
 async function runScenario(updates, idleMs = 20, waitMs = 400, afterReady) {
   const home = await mkdtemp(join(tmpdir(), 'dsh-telegram-command-'))
+  const previousHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
   const agent = makeAgent('session-one', '/tmp/default-workspace', idleMs)
   const context = makeContext(agent)
@@ -142,7 +184,7 @@ async function runScenario(updates, idleMs = 20, waitMs = 400, afterReady) {
   const originalRequest = https.request
   https.request = telegram.fake
   try {
-    const { apply } = await import('../index.js')
+    const { apply } = await import(`../index.js?scenario=${encodeURIComponent(home)}`)
     apply(context.ctx, {
       enabled: true,
       tokenRef: 'TEST_TOKEN',
@@ -152,14 +194,19 @@ async function runScenario(updates, idleMs = 20, waitMs = 400, afterReady) {
       language: 'en',
       showThinking: false,
     })
-    await new Promise((resolve) => setTimeout(resolve, waitMs))
-    if (afterReady !== undefined) await afterReady({ agent, calls: telegram.calls })
-    return { calls: telegram.calls, agent, logs: context.logs, cleanup: context.cleanup }
+    await until(() => telegram.drained, 'updates processed')
+    if (afterReady !== undefined) await afterReady({ agent, host: context.host, calls: telegram.calls })
+    return { calls: telegram.calls, agent, uploads: context.uploads, logs: context.logs, cleanup: async () => {
+      context.cleanup()
+      await rm(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 })
+    } }
   } catch (error) {
     context.cleanup()
     throw error
   } finally {
     https.request = originalRequest
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
   }
 }
 
@@ -192,54 +239,81 @@ test('/restart in All never creates a session topic', async () => {
     const topics = result.calls.filter((call) => call.method === 'createForumTopic')
     assert.equal(topics.length, 0)
   } finally {
-    result.cleanup()
+    await result.cleanup()
   }
 })
 
-test('fork creates one new topic with the requested name', async () => {
+test('/fork is intentionally disabled and never forks the original session', async () => {
   const result = await runScenario([all('hello'), topic(7001, '/fork branch', 400)], 20, 900)
   try {
     const topics = result.calls.filter((call) => call.method === 'createForumTopic')
-    assert.equal(topics.length, 2, 'initial topic plus fork topic')
-    assert.equal(topics[1].body.name, 'branch')
+    assert.equal(topics.length, 1, 'only the original session topic exists')
+    assert.equal(result.agent.operations.includes('fork'), false, 'native fork must not be called')
+    assert.ok(result.calls.some(call => call.method === 'sendMessage' && /Форки.*отключены/.test(call.body.text)), 'explicitly explain that Telegram forks are disabled')
+    assert.equal(result.agent.received.length, 1, '/fork is not forwarded as a prompt')
     assert.equal(result.logs.filter((line) => line.startsWith('W ') && !line.includes('getUpdates failed')).length, 0, result.logs.join('\n'))
   } finally {
-    result.cleanup()
+    await result.cleanup()
   }
 })
 
 test('a provider title event renames the existing topic', async () => {
-  const result = await runScenario([all('hello')], 20, 350, async ({ agent }) => {
-    agent.events.emit('session/event', { id: 'session-one' }, {
-      type: 'session/title',
+  const result = await runScenario([all('hello')], 20, 350, async ({ agent, host, calls }) => {
+    host.emit('session/event', agent.session, {
+      seq: 1, type: 'session/title',
       data: { title: 'Provider title' },
     })
-    await new Promise((resolve) => setTimeout(resolve, 100))
+    await until(() => calls.some((call) => call.method === 'editForumTopic' && call.body.name === 'Provider title'), 'provider title rename')
   })
   try {
     const edits = result.calls.filter((call) => call.method === 'editForumTopic')
     assert.equal(edits.length > 0, true)
     assert.equal(edits.at(-1).body.name, 'Provider title')
   } finally {
-    result.cleanup()
+    await result.cleanup()
   }
 })
 
-test('stop settles a running Telegram turn without duplicates', async () => {
+test('stop clears an idle parked inbox once without discarding later submissions', async () => {
+  const later = topic(7001, 'submitted after stop', 0)
+  later.update_id = 3
+  later.message.message_id = 3
   const result = await runScenario([
     all('slow task'),
     topic(7001, '/stop', 120),
     topic(7001, '/stop', 160),
+    later,
   ], 1000, 500)
   try {
     assert.equal(result.logs.some((line) => line.includes('warn is not defined')), false)
     const stopped = result.calls.filter((call) =>
-      call.method === 'sendMessage' && typeof call.body?.text === 'string' && call.body.text.includes('Stopped.'),
+      call.method === 'sendMessage' && typeof call.body?.text === 'string' && call.body.text.includes('Stop requested') && call.body.text.includes('pending session input discarded'),
     )
     assert.equal(stopped.length, 1)
+    assert.deepEqual(result.agent.operations, ['clear', 'cancel'], 'idle Inbox.clear precedes cancellation, which alone is a no-op while idle')
+    assert.deepEqual(result.agent.cancellations, [{ kind: 'user' }])
+    assert.equal(result.agent.received.length, 2, 'both earlier and later submissions were admitted')
+    assert.deepEqual(result.agent.inbox.pending.map(request => request.requestId), ['telegram:100:3'], 'clear discards only input parked before stop')
   } finally {
-    result.cleanup()
+    await result.cleanup()
   }
+})
+
+test('a Telegram photo uses native image bytes rather than an attachment reference', async () => {
+  const photo = topicFile(1, 0)
+  delete photo.message.document
+  photo.message.photo = [{ file_id: 'photo-small', width: 10, height: 10 }, { file_id: 'photo-large', width: 100, height: 100 }]
+  photo.message.caption = 'inspect this photo'
+  const result = await runScenario([photo])
+  try {
+    assert.equal(result.agent.received.length, 1)
+    assert.deepEqual(result.agent.received[0].content, [
+      { type: 'text', text: 'inspect this photo' },
+      { type: 'image', data: Buffer.from('file-data').toString('base64'), mediaType: 'image/jpeg', name: 'telegram-photo-2.jpg' },
+    ])
+    assert.equal(result.uploads.length, 0, 'images do not use document upload receipts')
+    assert.deepEqual(result.calls.find(call => call.method === 'getFile').body, { file_id: 'photo-large' })
+  } finally { await result.cleanup() }
 })
 
 test('a document in All reaches the agent as a file attachment', async () => {
@@ -248,9 +322,11 @@ test('a document in All reaches the agent as a file attachment', async () => {
     assert.equal(result.calls.filter((call) => call.method === 'createForumTopic').length, 1)
     assert.equal(result.agent.received.length, 1)
     const content = result.agent.received[0].content
-    assert.equal(content.some((part) => part.type === 'file'), true)
-    assert.equal(content.find((part) => part.type === 'file').attachment.name, 'test.txt')
+    assert.deepEqual(content, [{ type: 'text', text: 'read this file' }, { type: 'file', receiptId: 'receipt-test-file' }])
+    assert.equal(result.uploads.length, 1)
+    assert.equal(result.uploads[0].receiver, result.agent)
+    assert.equal(result.uploads[0].request.name, 'test.txt')
   } finally {
-    result.cleanup()
+    await result.cleanup()
   }
 })
